@@ -130,47 +130,72 @@ def fetch_jobs():
 
 
 def fetch_jobs_fallback():
-    """Fallback: scrape the HTML jobs page directly.
-    Since REST APIs return 403, we parse the rendered page for job listings.
+    """Fallback: Query the AWS AppSync GraphQL endpoint used by the React app.
+    Since REST APIs return 403, we use the same GraphQL endpoint the site uses.
     """
     try:
-        # Request the jobs page itself with proper headers
-        page_url = "https://www.jobsatamazon.co.uk/"
-        resp = requests.get(page_url, headers=HEADERS, timeout=30)
+        # AppSync endpoint discovered from jobsatamazon.co.uk JS bundle
+        graphql_url = "https://aubvydm7hvgezbr5vteeofwvyq.appsync-api.eu-west-1.amazonaws.com/graphql"
+        
+        # Minimal GraphQL query for job search
+        query = """
+        query SearchJobs($locale: String!, $country: String!, $distance: Int!, $lat: Float!, $lng: Float!, $pageSize: Int!) {
+            searchJobs(locale: $locale, country: $country, distance: $distance, latitude: $lat, longitude: $lng, pageSize: $pageSize) {
+                jobs {
+                    jobId
+                    title
+                    city
+                    state
+                    postalCode
+                    pay
+                    employmentType
+                    scheduleType
+                    description
+                    firstDayOnSite
+                    schedule
+                    hoursPerWeek
+                    totalOpenings
+                    url
+                }
+            }
+        }
+        """
+        
+        payload = {
+            "query": query,
+            "variables": {
+                "locale": "en-GB",
+                "country": "GBR",
+                "distance": MAX_MILES,
+                "lat": CENTRE_LAT,
+                "lng": CENTRE_LON,
+                "pageSize": 100,
+            }
+        }
+        
+        resp = requests.post(graphql_url, json=payload, headers=HEADERS, timeout=30)
         resp.raise_for_status()
+        data = resp.json()
         
-        # If the page loads, look for embedded JSON data in script tags or HTML structure
-        # The React app embeds initial state as JSON in <script> tags
-        import re
-        page_content = resp.text
+        # Check for GraphQL errors
+        if "errors" in data:
+            log.warning(f"GraphQL errors: {data['errors']}")
+            return []
         
-        # Try to extract JSON data from common locations (e.g., window.__INITIAL_STATE__)
-        json_patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
-            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(\{.*?\})<\/script>',
-            r'"jobs"\s*:\s*(\[.*?\])',
-        ]
+        # Extract jobs from response
+        if "data" in data and data["data"].get("searchJobs"):
+            jobs = data["data"]["searchJobs"].get("jobs", [])
+            if jobs:
+                log.info(f"GraphQL query: extracted {len(jobs)} jobs")
+                return jobs
         
-        for pattern in json_patterns:
-            match = re.search(pattern, page_content, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                    jobs = data if isinstance(data, list) else data.get("jobs", [])
-                    if jobs:
-                        log.info(f"HTML scrape: extracted {len(jobs)} jobs from page")
-                        return jobs
-                except (json.JSONDecodeError, KeyError):
-                    continue
-        
-        log.warning("No job data found in HTML page content")
         return []
         
     except requests.RequestException as e:
-        log.error(f"Fallback HTML scrape failed: {e}")
+        log.warning(f"GraphQL fallback failed: {type(e).__name__}: {e}")
         return []
     except Exception as e:
-        log.error(f"Fallback scrape error: {e}")
+        log.error(f"GraphQL scrape error: {e}")
         return []
 
 
