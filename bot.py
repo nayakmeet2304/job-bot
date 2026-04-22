@@ -119,39 +119,58 @@ def fetch_jobs():
                     log.info(f"Job fetch succeeded via fallback endpoint: {endpoint}")
                 return jobs
         except requests.RequestException as e:
-            log.warning(f"Endpoint failed ({endpoint}): {e}")
+            log.warning(f"Endpoint failed ({endpoint}): {type(e).__name__}: {e}")
         except ValueError as e:
             log.warning(f"Invalid JSON from endpoint ({endpoint}): {e}")
 
-    # Last attempt: query-string GET variant used by some deployments.
+    log.info("REST endpoints blocked; attempting HTML scrape...")
     return fetch_jobs_fallback()
 
 
-ALT_API_URL = "https://www.jobsatamazon.co.uk/api/search"
+
 
 def fetch_jobs_fallback():
-    """Fallback to alternative API endpoint."""
+    """Fallback: scrape the HTML jobs page directly.
+    Since REST APIs return 403, we parse the rendered page for job listings.
+    """
     try:
-        params = {
-            "locale": "en-GB",
-            "country": "GBR",
-            "radius": MAX_MILES,
-            "latitude": CENTRE_LAT,
-            "longitude": CENTRE_LON,
-            "pageSize": 100,
-        }
-        resp = requests.get(ALT_API_URL, params=params, headers=HEADERS, timeout=30)
+        # Request the jobs page itself with proper headers
+        page_url = "https://www.jobsatamazon.co.uk/"
+        resp = requests.get(page_url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("jobs", data.get("results", []))
-    except requests.RequestException as e:
-        log.error(f"Fallback request failed: {e}")
+        
+        # If the page loads, look for embedded JSON data in script tags or HTML structure
+        # The React app embeds initial state as JSON in <script> tags
+        import re
+        page_content = resp.text
+        
+        # Try to extract JSON data from common locations (e.g., window.__INITIAL_STATE__)
+        json_patterns = [
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(\{.*?\})<\/script>',
+            r'"jobs"\s*:\s*(\[.*?\])',
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, page_content, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    jobs = data if isinstance(data, list) else data.get("jobs", [])
+                    if jobs:
+                        log.info(f"HTML scrape: extracted {len(jobs)} jobs from page")
+                        return jobs
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        
+        log.warning("No job data found in HTML page content")
         return []
-    except ValueError as e:
-        log.error(f"Fallback returned invalid JSON: {e}")
+        
+    except requests.RequestException as e:
+        log.error(f"Fallback HTML scrape failed: {e}")
         return []
     except Exception as e:
-        log.error(f"Fallback also failed: {e}")
+        log.error(f"Fallback scrape error: {e}")
         return []
 
 
@@ -360,9 +379,16 @@ def main():
     log.info("Starting Amazon Job Alert Bot...")
 
     if not TELEGRAM_TOKEN:
-        log.warning("⚠️  TELEGRAM_TOKEN not set. Messages will print to console.")
+        log.error("❌ TELEGRAM_TOKEN not set — bot cannot send Telegram messages!")
+        log.error("   Set TELEGRAM_TOKEN environment variable and restart.")
     if not TELEGRAM_CHAT_ID:
-        log.warning("⚠️  TELEGRAM_CHAT_ID not set. Messages will print to console.")
+        log.error("❌ TELEGRAM_CHAT_ID not set — bot cannot send Telegram messages!")
+        log.error("   Set TELEGRAM_CHAT_ID environment variable and restart.")
+
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        log.info("✓ Telegram credentials configured")
+    else:
+        log.warning("⚠️  Running in console-only mode (Telegram disabled)")
 
     seen = load_seen()
     log.info(f"Loaded {len(seen)} previously seen jobs.")
