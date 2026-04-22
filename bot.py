@@ -11,13 +11,6 @@ import math
 import logging
 import requests
 
-# Try to import Playwright for browser automation (optional, for fallback)
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -137,114 +130,81 @@ def fetch_jobs():
 
 
 def fetch_jobs_fallback():
-    """Fallback: Use Playwright browser automation to render and scrape jobs.
-    This is the most reliable approach since the site uses client-side rendering.
+    """Fallback: Attempt to parse job data from the Amazon jobs page.
+    Note: The site uses client-side rendering (JavaScript SPA), making it 
+    difficult to fetch jobs without a browser. This is a best-effort attempt.
     """
-    if not PLAYWRIGHT_AVAILABLE:
-        log.error(
-            "Playwright not installed. Install with: pip install playwright"
-        )
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log.warning("BeautifulSoup not available; cannot parse HTML")
         log.info(
-            "For now, jobs cannot be fetched. "
-            "Consider installing playwright or finding Amazon's official jobs API."
+            "The jobsatamazon.co.uk website uses client-side rendering and requires "
+            "a JavaScript-capable browser to load jobs. Solutions:\n"
+            "1) Use a headless browser like Selenium or Playwright\n"
+            "2) Check if Amazon provides an official jobs feed/API\n"
+            "3) Wait for the site's API to be publicly documented"
         )
         return []
     
     try:
-        log.info("Starting Playwright browser to fetch jobs...")
+        log.info("Attempting to fetch and parse Amazon jobs page...")
         
-        with sync_playwright() as p:
-            # Launch browser (headless mode for Railway)
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=HEADERS.get("User-Agent", ""))
-            
-            # Set timeout and navigation
-            page.set_default_timeout(30000)  # 30 seconds
-            
-            # Navigate to jobs page with geo filters
-            jobs_url = (
-                f"https://www.jobsatamazon.co.uk/app#/jobSearch"
-                f"?lat={CENTRE_LAT}&lng={CENTRE_LON}&distance={MAX_MILES}"
-            )
-            log.info(f"Loading: {jobs_url}")
-            page.goto(jobs_url, wait_until="networkidle")
-            
-            # Wait for job listings to appear
-            try:
-                page.wait_for_selector("[data-testid='job-card']", timeout=10000)
-            except:
-                page.wait_for_selector(".job-card", timeout=10000)
-            
-            # Extract job listings from DOM
-            jobs = []
-            
-            # Try multiple selectors for job cards
-            job_elements = page.query_selector_all(
-                "[data-testid='job-card'], .job-card, [class*='job'][class*='item']"
-            )
-            
-            if not job_elements:
-                log.warning("No job elements found in DOM")
-                browser.close()
-                return []
-            
-            log.info(f"Found {len(job_elements)} job cards in DOM")
-            
-            for elem in job_elements[:100]:  # Limit to first 100 to avoid slowdown
+        # Try to fetch the main page
+        resp = requests.get(
+            "https://www.jobsatamazon.co.uk/",
+            headers=HEADERS,
+            timeout=30
+        )
+        resp.raise_for_status()
+        
+        # Parse HTML
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Look for job data in script tags (React apps often embed JSON there)
+        scripts = soup.find_all("script")
+        job_data = None
+        
+        for script in scripts:
+            if script.string and ("jobs" in script.string or "jobId" in script.string):
                 try:
-                    # Extract text content
-                    title = elem.query_selector("h2, [class*='title']")
-                    title = title.text_content() if title else "Warehouse Operative"
-                    
-                    location = elem.query_selector("[class*='location'], [class*='address']")
-                    location = location.text_content() if location else "Unknown"
-                    
-                    pay = elem.query_selector("[class*='pay'], [class*='salary']")
-                    pay = pay.text_content() if pay else ""
-                    
-                    job_link = elem.query_selector("a[href]")
-                    url = job_link.get_attribute("href") if job_link else ""
-                    if url and not url.startswith("http"):
-                        url = "https://www.jobsatamazon.co.uk" + url
-                    
-                    # Extract or generate job ID
-                    job_id = url.split("jobId=")[-1] if "jobId=" in url else f"PW-{int(time.time())}-{len(jobs)}"
-                    
-                    # Create job dict
-                    job = {
-                        "job_id": job_id,
-                        "title": title.strip(),
-                        "city": location.split(",")[0] if "," in location else location.strip(),
-                        "state": "England",
-                        "postal": "",
-                        "pay": pay.strip(),
-                        "employment_type": "",
-                        "schedule_type": "",
-                        "description": "",
-                        "first_day": "",
-                        "schedule": "",
-                        "hours": "",
-                        "openings": 1,
-                        "url": url,
-                    }
-                    
-                    jobs.append(job)
-                    
-                except Exception as e:
-                    log.debug(f"Error parsing job element: {e}")
+                    # Try to extract JSON from common React patterns
+                    content = script.string
+                    # Look for JSON arrays or objects
+                    import re
+                    json_match = re.search(r'\{\s*"?jobs"?\s*:\s*\[', content)
+                    if json_match:
+                        start = content.rfind('{', 0, json_match.start())
+                        # Find matching closing brace
+                        depth = 0
+                        for i in range(start, len(content)):
+                            if content[i] == '{':
+                                depth += 1
+                            elif content[i] == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    json_str = content[start:i+1]
+                                    job_data = json.loads(json_str)
+                                    break
+                        if job_data:
+                            break
+                except (json.JSONDecodeError, ValueError, IndexError):
                     continue
-            
-            browser.close()
-            
-            if jobs:
-                log.info(f"✓ Playwright: extracted {len(jobs)} jobs from rendered page")
+        
+        if job_data and "jobs" in job_data:
+            jobs = job_data["jobs"]
+            if isinstance(jobs, list) and jobs:
+                log.info(f"✓ Extracted {len(jobs)} jobs from page")
                 return jobs
-            else:
-                log.warning("Playwright loaded page but found no jobs")
-                return []
-                
+        
+        log.warning("No job listings found in page HTML")
+        return []
+        
+    except requests.RequestException as e:
+        log.warning(f"Failed to fetch Amazon jobs page: {e}")
+        return []
     except Exception as e:
-        log.error(f"Playwright browser fetch failed: {type(e).__name__}: {e}")
+        log.error(f"HTML parsing failed: {e}")
         return []
 
 
