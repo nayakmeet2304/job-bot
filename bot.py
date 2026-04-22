@@ -11,6 +11,13 @@ import math
 import logging
 import requests
 
+# Try to import Playwright for browser automation (optional, for fallback)
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -130,90 +137,115 @@ def fetch_jobs():
 
 
 def fetch_jobs_fallback():
-    """Fallback: Try multiple job fetch strategies.
-    1. Look for public jobs endpoint
-    2. Scrape rendered page
+    """Fallback: Use Playwright browser automation to render and scrape jobs.
+    This is the most reliable approach since the site uses client-side rendering.
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        log.error(
+            "Playwright not installed. Install with: pip install playwright"
+        )
+        log.info(
+            "For now, jobs cannot be fetched. "
+            "Consider installing playwright or finding Amazon's official jobs API."
+        )
+        return []
     
-    # Strategy 1: Try common public API endpoints
-    public_endpoints = [
-        "https://www.jobsatamazon.co.uk/api/jobs",
-        "https://www.jobsatamazon.co.uk/api/listings",
-        "https://www.jobsatamazon.co.uk/api/v2/jobs",
-    ]
-    
-    for endpoint in public_endpoints:
-        try:
-            resp = requests.get(
-                endpoint, 
-                headers=HEADERS, 
-                params={
-                    "latitude": CENTRE_LAT,
-                    "longitude": CENTRE_LON,
-                    "radius": MAX_MILES,
-                    "pageSize": 100,
-                },
-                timeout=30
-            )
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    jobs = data.get("jobs", data.get("results", []))
-                    if isinstance(jobs, list) and jobs:
-                        log.info(f"Public endpoint success: extracted {len(jobs)} jobs from {endpoint}")
-                        return jobs
-                except (ValueError, KeyError):
-                    pass
-        except requests.RequestException as e:
-            log.debug(f"Public endpoint {endpoint} failed: {type(e).__name__}")
-    
-    # Strategy 2: Attempt to scrape the main page for inline job data
     try:
-        log.info("Attempting HTML page scrape...")
-        resp = requests.get("https://www.jobsatamazon.co.uk/", headers=HEADERS, timeout=30)
-        resp.raise_for_status()
+        log.info("Starting Playwright browser to fetch jobs...")
         
-        import re
-        html = resp.text
-        
-        # Look for job data in common script tags or inline JSON
-        # Try to find data-attributes or window globals
-        patterns = [
-            r'"jobs"\s*:\s*\[\s*\{[^}]*"jobId"[^]]*\]',  # jobs array with jobId
-            r'<script[^>]*>\s*window\.INITIAL_STATE\s*=\s*(\{[^}]*jobs[^}]*\})',  # React initial state
-            r'"results"\s*:\s*\[\s*\{[^}]*"id"[^]]*\]',  # results array
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, html, re.DOTALL)
-            if matches:
-                log.debug(f"Found potential job data in HTML")
+        with sync_playwright() as p:
+            # Launch browser (headless mode for Railway)
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=HEADERS.get("User-Agent", ""))
+            
+            # Set timeout and navigation
+            page.set_default_timeout(30000)  # 30 seconds
+            
+            # Navigate to jobs page with geo filters
+            jobs_url = (
+                f"https://www.jobsatamazon.co.uk/app#/jobSearch"
+                f"?lat={CENTRE_LAT}&lng={CENTRE_LON}&distance={MAX_MILES}"
+            )
+            log.info(f"Loading: {jobs_url}")
+            page.goto(jobs_url, wait_until="networkidle")
+            
+            # Wait for job listings to appear
+            try:
+                page.wait_for_selector("[data-testid='job-card']", timeout=10000)
+            except:
+                page.wait_for_selector(".job-card", timeout=10000)
+            
+            # Extract job listings from DOM
+            jobs = []
+            
+            # Try multiple selectors for job cards
+            job_elements = page.query_selector_all(
+                "[data-testid='job-card'], .job-card, [class*='job'][class*='item']"
+            )
+            
+            if not job_elements:
+                log.warning("No job elements found in DOM")
+                browser.close()
+                return []
+            
+            log.info(f"Found {len(job_elements)} job cards in DOM")
+            
+            for elem in job_elements[:100]:  # Limit to first 100 to avoid slowdown
                 try:
-                    # Try parsing as JSON
-                    for match in matches:
-                        data = json.loads(match)
-                        jobs = data if isinstance(data, list) else data.get("jobs", [])
-                        if isinstance(jobs, list) and len(jobs) > 0:
-                            log.info(f"HTML scrape: extracted {len(jobs)} jobs")
-                            return jobs
-                except (json.JSONDecodeError, KeyError, TypeError):
+                    # Extract text content
+                    title = elem.query_selector("h2, [class*='title']")
+                    title = title.text_content() if title else "Warehouse Operative"
+                    
+                    location = elem.query_selector("[class*='location'], [class*='address']")
+                    location = location.text_content() if location else "Unknown"
+                    
+                    pay = elem.query_selector("[class*='pay'], [class*='salary']")
+                    pay = pay.text_content() if pay else ""
+                    
+                    job_link = elem.query_selector("a[href]")
+                    url = job_link.get_attribute("href") if job_link else ""
+                    if url and not url.startswith("http"):
+                        url = "https://www.jobsatamazon.co.uk" + url
+                    
+                    # Extract or generate job ID
+                    job_id = url.split("jobId=")[-1] if "jobId=" in url else f"PW-{int(time.time())}-{len(jobs)}"
+                    
+                    # Create job dict
+                    job = {
+                        "job_id": job_id,
+                        "title": title.strip(),
+                        "city": location.split(",")[0] if "," in location else location.strip(),
+                        "state": "England",
+                        "postal": "",
+                        "pay": pay.strip(),
+                        "employment_type": "",
+                        "schedule_type": "",
+                        "description": "",
+                        "first_day": "",
+                        "schedule": "",
+                        "hours": "",
+                        "openings": 1,
+                        "url": url,
+                    }
+                    
+                    jobs.append(job)
+                    
+                except Exception as e:
+                    log.debug(f"Error parsing job element: {e}")
                     continue
-        
-        log.warning("No job data found in HTML")
-        
+            
+            browser.close()
+            
+            if jobs:
+                log.info(f"✓ Playwright: extracted {len(jobs)} jobs from rendered page")
+                return jobs
+            else:
+                log.warning("Playwright loaded page but found no jobs")
+                return []
+                
     except Exception as e:
-        log.debug(f"HTML scrape failed: {e}")
-    
-    # Strategy 3: Log helpful message for the user
-    log.warning(
-        "All public endpoints exhausted. The site may require browser automation "
-        "(Selenium/Playwright) to fetch jobs. Consider: "
-        "1) Using a web scraping service "
-        "2) Checking if Amazon provides an official jobs feed "
-        "3) Using Playwright in Railway (requires additional setup)"
-    )
-    
-    return []
+        log.error(f"Playwright browser fetch failed: {type(e).__name__}: {e}")
+        return []
 
 
 def parse_job(job: dict) -> dict | None:
