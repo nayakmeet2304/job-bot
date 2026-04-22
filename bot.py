@@ -130,82 +130,162 @@ def fetch_jobs():
 
 
 def fetch_jobs_fallback():
-    """Fallback: Attempt to parse job data from the Amazon jobs page.
-    Note: The site uses client-side rendering (JavaScript SPA), making it 
-    difficult to fetch jobs without a browser. This is a best-effort attempt.
+    """Fallback: Use Selenium to render jobsatamazon.co.uk and fetch jobs.
+    Selenium can render JavaScript and is compatible with Python 3.13.
+    Attempts to find Chrome from multiple sources (system, webdriver-manager).
     """
     try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        log.warning("BeautifulSoup not available; cannot parse HTML")
-        log.info(
-            "The jobsatamazon.co.uk website uses client-side rendering and requires "
-            "a JavaScript-capable browser to load jobs. Solutions:\n"
-            "1) Use a headless browser like Selenium or Playwright\n"
-            "2) Check if Amazon provides an official jobs feed/API\n"
-            "3) Wait for the site's API to be publicly documented"
-        )
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.chrome.service import Service
+        import os
+    except ImportError as e:
+        log.error(f"Selenium not installed: {e}")
+        log.info("Install with: pip install selenium webdriver-manager")
         return []
     
+    driver = None
     try:
-        log.info("Attempting to fetch and parse Amazon jobs page...")
+        log.info("Starting Selenium browser to fetch jobs...")
         
-        # Try to fetch the main page
-        resp = requests.get(
-            "https://www.jobsatamazon.co.uk/",
-            headers=HEADERS,
-            timeout=30
+        # Setup Chrome options for headless mode
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument(f"user-agent={HEADERS.get('User-Agent', '')}")
+        
+        # Try to find Chrome in common locations
+        chrome_paths = [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/snap/bin/chromium",
+        ]
+        
+        chrome_binary = None
+        for path in chrome_paths:
+            if os.path.exists(path):
+                log.info(f"Found Chrome at: {path}")
+                chrome_binary = path
+                options.binary_location = path
+                break
+        
+        # If Chrome not found in standard paths, try webdriver-manager
+        if not chrome_binary:
+            log.info("Chrome not found in standard paths; using webdriver-manager...")
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                chrome_driver_path = ChromeDriverManager().install()
+                service = Service(chrome_driver_path)
+            except Exception as e:
+                log.error(f"Could not get ChromeDriver: {e}")
+                return []
+        else:
+            service = None
+        
+        # Create driver
+        if service:
+            driver = webdriver.Chrome(service=service, options=options)
+        else:
+            driver = webdriver.Chrome(options=options)
+        
+        # Navigate to jobs page with geo filters
+        jobs_url = (
+            f"https://www.jobsatamazon.co.uk/app#/jobSearch"
+            f"?lat={CENTRE_LAT}&lng={CENTRE_LON}&distance={MAX_MILES}"
         )
-        resp.raise_for_status()
+        log.info(f"Loading: {jobs_url}")
+        driver.get(jobs_url)
         
-        # Parse HTML
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # Wait for job listings to appear (up to 20 seconds)
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "[data-testid='job-card']"))
+            )
+        except:
+            # Fallback: wait for any job container
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_all_elements_located((By.CLASS_NAME, "job-card"))
+                )
+            except:
+                log.warning("No job cards found within timeout")
+                return []
         
-        # Look for job data in script tags (React apps often embed JSON there)
-        scripts = soup.find_all("script")
-        job_data = None
+        # Extract jobs from page
+        jobs = []
+        job_elements = driver.find_elements(By.CSS_SELECTOR, "[data-testid='job-card'], .job-card")
         
-        for script in scripts:
-            if script.string and ("jobs" in script.string or "jobId" in script.string):
-                try:
-                    # Try to extract JSON from common React patterns
-                    content = script.string
-                    # Look for JSON arrays or objects
-                    import re
-                    json_match = re.search(r'\{\s*"?jobs"?\s*:\s*\[', content)
-                    if json_match:
-                        start = content.rfind('{', 0, json_match.start())
-                        # Find matching closing brace
-                        depth = 0
-                        for i in range(start, len(content)):
-                            if content[i] == '{':
-                                depth += 1
-                            elif content[i] == '}':
-                                depth -= 1
-                                if depth == 0:
-                                    json_str = content[start:i+1]
-                                    job_data = json.loads(json_str)
-                                    break
-                        if job_data:
-                            break
-                except (json.JSONDecodeError, ValueError, IndexError):
-                    continue
+        if not job_elements:
+            log.warning("No job elements found in rendered DOM")
+            return []
         
-        if job_data and "jobs" in job_data:
-            jobs = job_data["jobs"]
-            if isinstance(jobs, list) and jobs:
-                log.info(f"✓ Extracted {len(jobs)} jobs from page")
-                return jobs
+        log.info(f"Found {len(job_elements)} job cards in DOM")
         
-        log.warning("No job listings found in page HTML")
-        return []
+        for elem in job_elements[:100]:  # Limit to first 100 to avoid slowdown
+            try:
+                # Extract text content
+                title_elem = elem.find_elements(By.CSS_SELECTOR, "h2, [class*='title']")
+                title = title_elem[0].text if title_elem else "Warehouse Operative"
+                
+                location_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='address']")
+                location = location_elem[0].text if location_elem else "Unknown"
+                
+                pay_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='pay'], [class*='salary']")
+                pay = pay_elem[0].text if pay_elem else ""
+                
+                link_elem = elem.find_elements(By.CSS_SELECTOR, "a[href]")
+                url = link_elem[0].get_attribute("href") if link_elem else ""
+                if url and not url.startswith("http"):
+                    url = "https://www.jobsatamazon.co.uk" + url
+                
+                # Extract or generate job ID
+                job_id = url.split("jobId=")[-1] if "jobId=" in url else f"SEL-{int(time.time())}-{len(jobs)}"
+                
+                # Create job dict
+                job = {
+                    "job_id": job_id,
+                    "title": title.strip(),
+                    "city": location.split(",")[0] if "," in location else location.strip(),
+                    "state": "England",
+                    "postal": "",
+                    "pay": pay.strip(),
+                    "employment_type": "",
+                    "schedule_type": "",
+                    "description": "",
+                    "first_day": "",
+                    "schedule": "",
+                    "hours": "",
+                    "openings": 1,
+                    "url": url,
+                }
+                
+                jobs.append(job)
+                
+            except Exception as e:
+                log.debug(f"Error parsing job element: {e}")
+                continue
         
-    except requests.RequestException as e:
-        log.warning(f"Failed to fetch Amazon jobs page: {e}")
-        return []
+        if jobs:
+            log.info(f"✓ Selenium: extracted {len(jobs)} jobs from rendered page")
+            return jobs
+        else:
+            log.warning("Selenium loaded page but found no jobs")
+            return []
+            
     except Exception as e:
-        log.error(f"HTML parsing failed: {e}")
+        log.error(f"Selenium browser fetch failed: {type(e).__name__}: {e}")
         return []
+    finally:
+        if driver:
+            driver.quit()
 
 
 def parse_job(job: dict) -> dict | None:
