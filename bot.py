@@ -10,7 +10,6 @@ import time
 import math
 import logging
 import requests
-from datetime import datetime
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -74,8 +73,12 @@ HEADERS = {
     "Referer": "https://www.jobsatamazon.co.uk/",
 }
 
-# The internal API used by the jobsatamazon.co.uk React app
-API_URL = "https://hiring.amazon.co.uk/api/v1/search"
+# Job search endpoints to try. The legacy hiring.amazon.co.uk host no longer resolves.
+SEARCH_ENDPOINTS = [
+    "https://www.jobsatamazon.co.uk/api/search",
+    "https://www.jobsatamazon.co.uk/api/v1/search",
+    "https://hiring.amazon.co.uk/api/v1/search",  # legacy fallback
+]
 
 PAYLOAD = {
     "locale": "en-GB",
@@ -99,24 +102,29 @@ PAYLOAD = {
 
 
 def fetch_jobs():
-    """Call the Amazon internal jobs API and return list of job dicts."""
-    try:
-        resp = requests.post(
-            API_URL,
-            json=PAYLOAD,
-            headers=HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("jobs", [])
-    except requests.exceptions.HTTPError as e:
-        log.warning(f"HTTP error fetching jobs: {e}")
-        # Fallback: try alternative endpoint
-        return fetch_jobs_fallback()
-    except Exception as e:
-        log.error(f"Error fetching jobs: {e}")
-        return []
+    """Try multiple endpoints and return list of job dicts."""
+    for endpoint in SEARCH_ENDPOINTS:
+        try:
+            resp = requests.post(
+                endpoint,
+                json=PAYLOAD,
+                headers=HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            jobs = data.get("jobs", data.get("results", []))
+            if isinstance(jobs, list):
+                if endpoint != SEARCH_ENDPOINTS[0]:
+                    log.info(f"Job fetch succeeded via fallback endpoint: {endpoint}")
+                return jobs
+        except requests.RequestException as e:
+            log.warning(f"Endpoint failed ({endpoint}): {e}")
+        except ValueError as e:
+            log.warning(f"Invalid JSON from endpoint ({endpoint}): {e}")
+
+    # Last attempt: query-string GET variant used by some deployments.
+    return fetch_jobs_fallback()
 
 
 ALT_API_URL = "https://www.jobsatamazon.co.uk/api/search"
@@ -136,6 +144,12 @@ def fetch_jobs_fallback():
         resp.raise_for_status()
         data = resp.json()
         return data.get("jobs", data.get("results", []))
+    except requests.RequestException as e:
+        log.error(f"Fallback request failed: {e}")
+        return []
+    except ValueError as e:
+        log.error(f"Fallback returned invalid JSON: {e}")
+        return []
     except Exception as e:
         log.error(f"Fallback also failed: {e}")
         return []
@@ -269,7 +283,12 @@ def send_telegram(text: str):
         r.raise_for_status()
         log.info("Telegram message sent.")
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        body = ""
+        status = "unknown"
+        if hasattr(e, "response") and e.response is not None:
+            status = e.response.status_code
+            body = e.response.text
+        log.error(f"Telegram send failed: {e} | status={status} | body={body}")
 
 
 def send_startup_message():
