@@ -203,28 +203,65 @@ def fetch_jobs_fallback():
         log.info(f"Loading: {jobs_url}")
         driver.get(jobs_url)
         
-        # Wait for job listings to appear (up to 20 seconds)
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "[data-testid='job-card']"))
-            )
-        except:
-            # Fallback: wait for any job container
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CLASS_NAME, "job-card"))
-                )
-            except:
-                log.warning("No job cards found within timeout")
-                return []
+        # Wait for page to fully load
+        import time
+        time.sleep(5)  # Let JavaScript execute
         
-        # Extract jobs from page
-        jobs = []
-        job_elements = driver.find_elements(By.CSS_SELECTOR, "[data-testid='job-card'], .job-card")
+        # Debug: Log page source to understand structure
+        page_source = driver.page_source
+        if "job" in page_source.lower():
+            log.debug("Page contains 'job' keyword")
+        else:
+            log.warning("Page does not contain 'job' keyword - site may not be loaded")
+        
+        # Look for any element that might contain job info
+        try:
+            job_containers = driver.find_elements(By.CSS_SELECTOR, "[data-testid], [class*='job'], [class*='card'], article, section")
+            log.info(f"Found {len(job_containers)} potential containers on page")
+            
+            # Log first few element classes to help debug
+            for i, elem in enumerate(job_containers[:5]):
+                try:
+                    class_name = elem.get_attribute("class")
+                    test_id = elem.get_attribute("data-testid")
+                    tag = elem.tag_name
+                    log.debug(f"  Element {i}: <{tag}> class='{class_name}' testid='{test_id}'")
+                except:
+                    pass
+        except:
+            pass
+        
+        # Try multiple selectors in order of specificity
+        selectors_to_try = [
+            "[data-testid='job-card']",
+            "[class*='job-card']",
+            "[class*='JobCard']",
+            "article[class*='job']",
+            "[class*='job'][class*='item']",
+            "[class*='position'][class*='card']",
+            ".job",
+            "[class*='listing']",
+        ]
+        
+        job_elements = []
+        for selector in selectors_to_try:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    log.info(f"Found {len(elements)} elements with selector: {selector}")
+                    job_elements = elements
+                    break
+            except:
+                continue
         
         if not job_elements:
-            log.warning("No job elements found in rendered DOM")
-            return []
+            # Last resort: try to find ANY clickable job link
+            try:
+                job_elements = driver.find_elements(By.XPATH, "//a[contains(@href, 'jobDetail') or contains(@href, 'job')]")
+                if job_elements:
+                    log.info(f"Found {len(job_elements)} job links via href pattern")
+            except:
+                pass
         
         log.info(f"Found {len(job_elements)} job cards in DOM")
         
