@@ -304,26 +304,26 @@ def fetch_jobs_fallback():
                 # Extract or generate job ID
                 job_id = url.split("jobId=")[-1] if "jobId=" in url else f"SEL-{int(time.time())}-{len(jobs)}"
                 
-                # Create job dict
+                # Create job dict - use keys that parse_job() expects
                 job = {
-                    "job_id": job_id,
+                    "jobId": job_id,  # parse_job expects camelCase
                     "title": title.strip(),
                     "city": location.split(",")[0] if "," in location else location.strip(),
                     "state": "England",
-                    "postal": "",
+                    "postalCode": "",
                     "pay": pay.strip(),
-                    "employment_type": "",
-                    "schedule_type": "",
-                    "description": "",
-                    "first_day": "",
-                    "schedule": "",
-                    "hours": "",
-                    "openings": 1,
+                    "employmentType": "",
+                    "scheduleType": "",
+                    "jobDescription": "",
+                    "firstDayOnSite": "",
+                    "shiftCode": "",
+                    "hoursPerWeek": "",
+                    "totalOpenings": 1,
                     "url": url,
                 }
                 
                 jobs.append(job)
-                log.debug(f"Extracted job: {title[:30]} @ {location}")
+                log.debug(f"Extracted job: {title[:40]} @ {location} (ID: {job_id})")
                 
             except Exception as e:
                 log.debug(f"Error parsing job element: {e}")
@@ -354,6 +354,7 @@ def parse_job(job: dict) -> dict | None:
             or ""
         )
         if not job_id:
+            log.debug(f"Job rejected: no jobId found. Keys: {list(job.keys())}")
             return None
 
         title = job.get("title") or job.get("jobTitle") or "Warehouse Operative"
