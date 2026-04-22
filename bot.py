@@ -162,11 +162,10 @@ def fetch_jobs_fallback():
         # Try to find Chrome in common locations
         chrome_paths = [
             "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/snap/bin/chromium",
         ]
         
         chrome_binary = None
