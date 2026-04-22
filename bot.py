@@ -130,73 +130,90 @@ def fetch_jobs():
 
 
 def fetch_jobs_fallback():
-    """Fallback: Query the AWS AppSync GraphQL endpoint used by the React app.
-    Since REST APIs return 403, we use the same GraphQL endpoint the site uses.
+    """Fallback: Try multiple job fetch strategies.
+    1. Look for public jobs endpoint
+    2. Scrape rendered page
     """
+    
+    # Strategy 1: Try common public API endpoints
+    public_endpoints = [
+        "https://www.jobsatamazon.co.uk/api/jobs",
+        "https://www.jobsatamazon.co.uk/api/listings",
+        "https://www.jobsatamazon.co.uk/api/v2/jobs",
+    ]
+    
+    for endpoint in public_endpoints:
+        try:
+            resp = requests.get(
+                endpoint, 
+                headers=HEADERS, 
+                params={
+                    "latitude": CENTRE_LAT,
+                    "longitude": CENTRE_LON,
+                    "radius": MAX_MILES,
+                    "pageSize": 100,
+                },
+                timeout=30
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    jobs = data.get("jobs", data.get("results", []))
+                    if isinstance(jobs, list) and jobs:
+                        log.info(f"Public endpoint success: extracted {len(jobs)} jobs from {endpoint}")
+                        return jobs
+                except (ValueError, KeyError):
+                    pass
+        except requests.RequestException as e:
+            log.debug(f"Public endpoint {endpoint} failed: {type(e).__name__}")
+    
+    # Strategy 2: Attempt to scrape the main page for inline job data
     try:
-        # AppSync endpoint discovered from jobsatamazon.co.uk JS bundle
-        graphql_url = "https://aubvydm7hvgezbr5vteeofwvyq.appsync-api.eu-west-1.amazonaws.com/graphql"
-        
-        # Minimal GraphQL query for job search
-        query = """
-        query SearchJobs($locale: String!, $country: String!, $distance: Int!, $lat: Float!, $lng: Float!, $pageSize: Int!) {
-            searchJobs(locale: $locale, country: $country, distance: $distance, latitude: $lat, longitude: $lng, pageSize: $pageSize) {
-                jobs {
-                    jobId
-                    title
-                    city
-                    state
-                    postalCode
-                    pay
-                    employmentType
-                    scheduleType
-                    description
-                    firstDayOnSite
-                    schedule
-                    hoursPerWeek
-                    totalOpenings
-                    url
-                }
-            }
-        }
-        """
-        
-        payload = {
-            "query": query,
-            "variables": {
-                "locale": "en-GB",
-                "country": "GBR",
-                "distance": MAX_MILES,
-                "lat": CENTRE_LAT,
-                "lng": CENTRE_LON,
-                "pageSize": 100,
-            }
-        }
-        
-        resp = requests.post(graphql_url, json=payload, headers=HEADERS, timeout=30)
+        log.info("Attempting HTML page scrape...")
+        resp = requests.get("https://www.jobsatamazon.co.uk/", headers=HEADERS, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
         
-        # Check for GraphQL errors
-        if "errors" in data:
-            log.warning(f"GraphQL errors: {data['errors']}")
-            return []
+        import re
+        html = resp.text
         
-        # Extract jobs from response
-        if "data" in data and data["data"].get("searchJobs"):
-            jobs = data["data"]["searchJobs"].get("jobs", [])
-            if jobs:
-                log.info(f"GraphQL query: extracted {len(jobs)} jobs")
-                return jobs
+        # Look for job data in common script tags or inline JSON
+        # Try to find data-attributes or window globals
+        patterns = [
+            r'"jobs"\s*:\s*\[\s*\{[^}]*"jobId"[^]]*\]',  # jobs array with jobId
+            r'<script[^>]*>\s*window\.INITIAL_STATE\s*=\s*(\{[^}]*jobs[^}]*\})',  # React initial state
+            r'"results"\s*:\s*\[\s*\{[^}]*"id"[^]]*\]',  # results array
+        ]
         
-        return []
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.DOTALL)
+            if matches:
+                log.debug(f"Found potential job data in HTML")
+                try:
+                    # Try parsing as JSON
+                    for match in matches:
+                        data = json.loads(match)
+                        jobs = data if isinstance(data, list) else data.get("jobs", [])
+                        if isinstance(jobs, list) and len(jobs) > 0:
+                            log.info(f"HTML scrape: extracted {len(jobs)} jobs")
+                            return jobs
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
         
-    except requests.RequestException as e:
-        log.warning(f"GraphQL fallback failed: {type(e).__name__}: {e}")
-        return []
+        log.warning("No job data found in HTML")
+        
     except Exception as e:
-        log.error(f"GraphQL scrape error: {e}")
-        return []
+        log.debug(f"HTML scrape failed: {e}")
+    
+    # Strategy 3: Log helpful message for the user
+    log.warning(
+        "All public endpoints exhausted. The site may require browser automation "
+        "(Selenium/Playwright) to fetch jobs. Consider: "
+        "1) Using a web scraping service "
+        "2) Checking if Amazon provides an official jobs feed "
+        "3) Using Playwright in Railway (requires additional setup)"
+    )
+    
+    return []
 
 
 def parse_job(job: dict) -> dict | None:
