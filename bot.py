@@ -276,12 +276,18 @@ def fetch_jobs_fallback():
                         url = "https://www.jobsatamazon.co.uk" + url
                     
                     title = elem.text.strip() if elem.text else "Warehouse Operative"
-                    location = "Unknown"
-                    pay = ""
+                    
+                    # Try to extract location/pay from parent container
+                    parent = elem.find_element(By.XPATH, "..")
+                    location_elem = parent.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='address']")
+                    location = location_elem[0].text if location_elem else "Unknown"
+                    
+                    pay_elem = parent.find_elements(By.CSS_SELECTOR, "[class*='pay'], [class*='salary']")
+                    pay = pay_elem[0].text if pay_elem else ""
                     
                 else:
                     # Element is a container - extract nested content
-                    title_elem = elem.find_elements(By.CSS_SELECTOR, "h2, [class*='title']")
+                    title_elem = elem.find_elements(By.CSS_SELECTOR, "h2, [class*='title'], a[href*='jobDetail']")
                     title = title_elem[0].text if title_elem else "Warehouse Operative"
                     
                     location_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='address']")
@@ -317,6 +323,7 @@ def fetch_jobs_fallback():
                 }
                 
                 jobs.append(job)
+                log.debug(f"Extracted job: {title[:30]} @ {location}")
                 
             except Exception as e:
                 log.debug(f"Error parsing job element: {e}")
