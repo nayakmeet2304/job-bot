@@ -265,22 +265,35 @@ def fetch_jobs_fallback():
         
         log.info(f"Found {len(job_elements)} job cards in DOM")
         
+        # Extract jobs from found elements
+        jobs = []
         for elem in job_elements[:100]:  # Limit to first 100 to avoid slowdown
             try:
-                # Extract text content
-                title_elem = elem.find_elements(By.CSS_SELECTOR, "h2, [class*='title']")
-                title = title_elem[0].text if title_elem else "Warehouse Operative"
-                
-                location_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='address']")
-                location = location_elem[0].text if location_elem else "Unknown"
-                
-                pay_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='pay'], [class*='salary']")
-                pay = pay_elem[0].text if pay_elem else ""
-                
-                link_elem = elem.find_elements(By.CSS_SELECTOR, "a[href]")
-                url = link_elem[0].get_attribute("href") if link_elem else ""
-                if url and not url.startswith("http"):
-                    url = "https://www.jobsatamazon.co.uk" + url
+                # If element is a link, get its href and text directly
+                if elem.tag_name == "a":
+                    url = elem.get_attribute("href")
+                    if not url.startswith("http"):
+                        url = "https://www.jobsatamazon.co.uk" + url
+                    
+                    title = elem.text.strip() if elem.text else "Warehouse Operative"
+                    location = "Unknown"
+                    pay = ""
+                    
+                else:
+                    # Element is a container - extract nested content
+                    title_elem = elem.find_elements(By.CSS_SELECTOR, "h2, [class*='title']")
+                    title = title_elem[0].text if title_elem else "Warehouse Operative"
+                    
+                    location_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='address']")
+                    location = location_elem[0].text if location_elem else "Unknown"
+                    
+                    pay_elem = elem.find_elements(By.CSS_SELECTOR, "[class*='pay'], [class*='salary']")
+                    pay = pay_elem[0].text if pay_elem else ""
+                    
+                    link_elem = elem.find_elements(By.CSS_SELECTOR, "a[href]")
+                    url = link_elem[0].get_attribute("href") if link_elem else ""
+                    if url and not url.startswith("http"):
+                        url = "https://www.jobsatamazon.co.uk" + url
                 
                 # Extract or generate job ID
                 job_id = url.split("jobId=")[-1] if "jobId=" in url else f"SEL-{int(time.time())}-{len(jobs)}"
