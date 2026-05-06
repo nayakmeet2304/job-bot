@@ -29,15 +29,10 @@ AMAZON_PIN        = os.environ.get("AMAZON_PIN",   "")
 AMAZON_OTP_METHOD = os.environ.get("AMAZON_OTP_METHOD", "sms")  # "sms" or "email"
 
 # ── Chrome profile ──────────────────────────────────────────────────────────
-# Open Chrome → go to chrome://version → copy "Profile Path"
-# CHROME_PROFILE_DIR  = the part up to (not including) the profile folder name
-# CHROME_PROFILE_NAME = the folder name (e.g. "Default", "Profile 1")
-#
-# Example on macOS:
-#   export CHROME_PROFILE_DIR="/Users/meet/Library/Application Support/Google/Chrome"
-#   export CHROME_PROFILE_NAME="Default"
-CHROME_PROFILE_DIR  = os.environ.get("CHROME_PROFILE_DIR",  "")
-CHROME_PROFILE_NAME = os.environ.get("CHROME_PROFILE_NAME", "Default")
+# The bot uses a dedicated profile stored in ~/.job-bot-chrome so it never
+# conflicts with your open Chrome window.  Cookies are saved between runs,
+# so OTP is only needed once (the very first login).
+BOT_CHROME_PROFILE = os.path.expanduser("~/.job-bot-chrome")
 
 CENTRE_LAT    = 52.6369
 CENTRE_LON    = -1.1398
@@ -109,32 +104,24 @@ def _bot_update_poller():
 # ─── CHROME DRIVER ───────────────────────────────────────────────────────────
 
 def start_driver() -> webdriver.Chrome:
+    os.makedirs(BOT_CHROME_PROFILE, exist_ok=True)
+    log.info(f"Using bot Chrome profile: {BOT_CHROME_PROFILE}")
+
     opts = Options()
+    opts.add_argument(f"--user-data-dir={BOT_CHROME_PROFILE}")
+    opts.add_argument("--profile-directory=Default")
     opts.add_argument("--start-maximized")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    if CHROME_PROFILE_DIR:
-        opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
-        opts.add_argument(f"--profile-directory={CHROME_PROFILE_NAME}")
-        log.info(f"Chrome profile: {CHROME_PROFILE_DIR} / {CHROME_PROFILE_NAME}")
-    else:
-        log.warning(
-            "CHROME_PROFILE_DIR not set — using a fresh profile.\n"
-            "Set it to your real Chrome profile to avoid repeated OTP prompts:\n"
-            "  export CHROME_PROFILE_DIR=\"/Users/meet/Library/Application Support/Google/Chrome\"\n"
-            "  export CHROME_PROFILE_NAME=\"Default\""
-        )
-
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         service = Service(ChromeDriverManager().install())
     except Exception:
-        service = Service()  # hope chromedriver is on PATH
+        service = Service()
 
     driver = webdriver.Chrome(service=service, options=opts)
-    # Hide automation flag
     driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     return driver
 
