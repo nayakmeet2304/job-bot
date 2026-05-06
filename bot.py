@@ -39,16 +39,24 @@ log = logging.getLogger(__name__)
 
 def login() -> tuple[requests.Session, str]:
     """
-    Use a headless Chromium browser to complete the phone+PIN login on
-    auth.hiring.amazon.com.  This lets AWS WAF's JS challenge run normally.
+    Open a visible browser window so the user can pass the AWS WAF
+    'Let's confirm you are human' check, then auto-fill phone + PIN.
     Returns (requests_session_with_cookies, bearer_token).
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    log.info("Launching headless browser for login...")
+    log.info("Opening browser window for login — a Chrome window will appear.")
+    print("\n" + "="*60)
+    print("A browser window will open.")
+    print("1. Click  'Begin'  on the security check page.")
+    print("2. The bot will then fill in your phone and PIN automatically.")
+    print("="*60 + "\n")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=False,
+            args=["--start-maximized"],
+        )
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -56,6 +64,7 @@ def login() -> tuple[requests.Session, str]:
                 "Chrome/147.0.0.0 Safari/537.36"
             ),
             locale="en-GB",
+            no_viewport=True,
         )
         page = ctx.new_page()
 
@@ -65,41 +74,47 @@ def login() -> tuple[requests.Session, str]:
         # ── Step 1: navigate to login ─────────────────────────────────────
         page.goto(
             "https://www.jobsatamazon.co.uk/app#/login",
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             timeout=30_000,
         )
 
-        # ── Step 2: enter phone number ────────────────────────────────────
-        phone_sel = 'input[type="tel"], input[name="username"], input[placeholder*="phone" i], input[placeholder*="mobile" i]'
-        try:
-            page.wait_for_selector(phone_sel, timeout=15_000)
-        except PWTimeout:
-            # Sometimes the page redirects to auth.hiring.amazon.com directly
-            page.goto("https://auth.hiring.amazon.com/#/login", wait_until="networkidle", timeout=20_000)
-            page.wait_for_selector(phone_sel, timeout=15_000)
+        # ── Step 2: handle WAF "confirm you are human" page ───────────────
+        # Wait up to 60s for either the WAF page or the real login form
+        phone_sel  = 'input[type="tel"], input[name="username"], input[placeholder*="phone" i], input[placeholder*="mobile" i]'
+        waf_sel    = 'button:has-text("Begin")'
+        login_or_waf = f'{phone_sel}, {waf_sel}'
 
+        page.wait_for_selector(login_or_waf, timeout=60_000)
+
+        # If the WAF challenge appeared, wait for the user to click Begin
+        if page.locator(waf_sel).count() > 0:
+            log.info("WAF security check detected — please click 'Begin' in the browser.")
+            # Wait until the WAF page is gone and the login form appears
+            page.wait_for_selector(phone_sel, timeout=120_000)
+
+        # ── Step 3: enter phone number ────────────────────────────────────
+        log.info("Login form detected — filling in phone number...")
         page.locator(phone_sel).first.fill(AMAZON_PHONE)
 
-        # Click the "Continue" / "Next" / "Send" button
         continue_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Next"), button:has-text("Sign in")'
         page.locator(continue_sel).first.click()
 
-        # ── Step 3: enter PIN ─────────────────────────────────────────────
+        # ── Step 4: enter PIN ─────────────────────────────────────────────
         pin_sel = 'input[type="password"], input[type="number"], input[name="pin"], input[placeholder*="pin" i], input[placeholder*="passcode" i]'
-        page.wait_for_selector(pin_sel, timeout=15_000)
+        page.wait_for_selector(pin_sel, timeout=20_000)
+        log.info("PIN screen detected — entering PIN...")
         page.locator(pin_sel).first.fill(AMAZON_PIN)
 
         verify_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Verify"), button:has-text("Sign in"), button:has-text("Confirm")'
         page.locator(verify_sel).first.click()
 
-        # ── Step 4: wait until we're back on the main site ───────────────
+        # ── Step 5: wait until back on main site ─────────────────────────
         try:
             page.wait_for_url("**/jobsatamazon.co.uk/**", timeout=30_000)
         except PWTimeout:
-            # Might land on auth domain; wait for the HVH cookie to appear
             page.wait_for_timeout(5_000)
 
-        # ── Step 5: extract cookies ───────────────────────────────────────
+        # ── Step 6: extract cookies ───────────────────────────────────────
         all_cookies = ctx.cookies()
         browser.close()
 
