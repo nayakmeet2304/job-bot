@@ -100,34 +100,64 @@ def login() -> tuple[requests.Session, str]:
         page.locator(continue_sel).first.click()
 
         # ── Step 4: enter PIN ─────────────────────────────────────────────
-        pin_sel = 'input[type="password"], input[type="number"], input[name="pin"], input[placeholder*="pin" i], input[placeholder*="passcode" i]'
+        pin_sel = (
+            'input[type="password"], input[type="number"], '
+            'input[name="pin"], input[placeholder*="pin" i], '
+            'input[placeholder*="passcode" i], input[maxlength="1"]'
+        )
         page.wait_for_selector(pin_sel, timeout=20_000)
         log.info("PIN screen detected — entering PIN...")
-        page.locator(pin_sel).first.fill(AMAZON_PIN)
 
-        verify_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Verify"), button:has-text("Sign in"), button:has-text("Confirm")'
+        pin_inputs = page.locator(pin_sel).all()
+        if len(pin_inputs) >= len(AMAZON_PIN):
+            # Individual single-digit boxes — type one digit per box
+            for i, digit in enumerate(AMAZON_PIN):
+                pin_inputs[i].click()
+                pin_inputs[i].type(digit)
+                page.wait_for_timeout(80)
+        else:
+            # Single PIN field
+            pin_inputs[0].fill(AMAZON_PIN)
+
+        verify_sel = (
+            'button[type="submit"], button:has-text("Continue"), '
+            'button:has-text("Verify"), button:has-text("Sign in"), '
+            'button:has-text("Confirm")'
+        )
         page.locator(verify_sel).first.click()
 
-        # ── Step 5: wait until back on main site ─────────────────────────
-        try:
-            page.wait_for_url("**/jobsatamazon.co.uk/**", timeout=30_000)
-        except PWTimeout:
-            page.wait_for_timeout(5_000)
+        # ── Step 5: poll for HVH_ACCESS_TOKEN (up to 30 s) ───────────────
+        log.info("Waiting for session token after PIN verification...")
+        hvh_cookie = None
+        for _ in range(30):
+            page.wait_for_timeout(1_000)
+            cookies_now = ctx.cookies()
+            hvh_cookie = next(
+                (c for c in cookies_now if c["name"] == "HVH_ACCESS_TOKEN"), None
+            )
+            if hvh_cookie:
+                log.info("Session token received.")
+                break
 
-        # ── Step 6: extract cookies ───────────────────────────────────────
+        # ── Step 6: extract all cookies then close ────────────────────────
         all_cookies = ctx.cookies()
+        if not hvh_cookie:
+            # Save screenshot to help diagnose
+            page.screenshot(path="login_failed.png")
+            log.error("Screenshot saved to login_failed.png")
         browser.close()
 
-    hvh = next((c for c in all_cookies if c["name"] == "HVH_ACCESS_TOKEN"), None)
-    if not hvh:
+    hvh_cookie = next((c for c in all_cookies if c["name"] == "HVH_ACCESS_TOKEN"), None)
+    if not hvh_cookie:
         cookie_names = [c["name"] for c in all_cookies]
         raise RuntimeError(
-            f"Login failed — HVH_ACCESS_TOKEN not found in cookies.\n"
+            "Login failed — HVH_ACCESS_TOKEN not found after PIN entry.\n"
             f"Cookies present: {cookie_names}\n"
-            "Check AMAZON_PHONE and AMAZON_PIN are correct."
+            "Check login_failed.png to see what went wrong.\n"
+            "Also verify AMAZON_PHONE and AMAZON_PIN are correct."
         )
 
-    bearer = unquote(hvh["value"])
+    bearer = unquote(hvh_cookie["value"])
 
     # Build a requests.Session pre-loaded with the browser cookies
     session = requests.Session()
