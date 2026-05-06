@@ -446,7 +446,12 @@ def fetch_jobs(driver) -> list:
                     "country":        "United Kingdom",
                     "keyWords":       "",
                     "equalFilters":   [],
-                    "containFilters": [{"key": "isPrivateSchedule", "val": ["true", "false"]}],
+                    "containFilters": [
+                        # Only physical warehouse/delivery roles (FC=Fulfilment Centre,
+                        # AMZL=Last Mile Delivery, SC=Sort Centre, RS=Receive Station)
+                        {"key": "normalizedJobCode", "val": ["FC", "AMZL", "SC", "RS"]},
+                        {"key": "isPrivateSchedule",  "val": ["true", "false"]},
+                    ],
                     "rangeFilters":   [],
                     "orFilters":      [],
                     "dateFilters":    [],
@@ -474,12 +479,25 @@ def fetch_jobs(driver) -> list:
         timeout=30,
     )
     resp.raise_for_status()
-    return (
+    jobs = (
         resp.json()
             .get("data", {})
             .get("searchJobCardsByLocation", {})
             .get("jobCards", [])
     )
+
+    # Drop virtual/remote roles — we only want physical warehouse jobs
+    physical = [j for j in jobs if not j.get("virtualLocation")]
+    if len(physical) != len(jobs):
+        log.info(f"Filtered out {len(jobs) - len(physical)} virtual/remote job(s).")
+
+    for j in physical:
+        log.info(
+            f"  Job: {j.get('jobTitle')} | {j.get('locationName') or j.get('city')} "
+            f"| {j.get('distanceL10N') or j.get('distance', '?')} away"
+        )
+
+    return physical
 
 # ─── SEEN JOBS ───────────────────────────────────────────────────────────────
 
