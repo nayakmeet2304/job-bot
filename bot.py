@@ -1,173 +1,425 @@
 """
 Amazon UK Warehouse Job Alert Bot
-Uses a headless browser (Playwright) to log in to jobsatamazon.co.uk,
-then polls the GraphQL API for new warehouse jobs near Leicester.
+Login mirrors opener_new.py — Selenium + real Chrome profile + Telegram OTP.
 """
 
 import os
 import json
 import time
+import queue
 import logging
+import threading
 import requests
 from urllib.parse import unquote
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+AMAZON_PHONE      = os.environ.get("AMAZON_PHONE", "")
+AMAZON_PIN        = os.environ.get("AMAZON_PIN",   "")
+AMAZON_OTP_METHOD = os.environ.get("AMAZON_OTP_METHOD", "sms")  # "sms" or "email"
 
-AMAZON_PHONE = os.environ.get("AMAZON_PHONE", "")  # e.g. +447352697050
-AMAZON_PIN   = os.environ.get("AMAZON_PIN",   "")  # your static PIN
+# ── Chrome profile ──────────────────────────────────────────────────────────
+# Open Chrome → go to chrome://version → copy "Profile Path"
+# CHROME_PROFILE_DIR  = the part up to (not including) the profile folder name
+# CHROME_PROFILE_NAME = the folder name (e.g. "Default", "Profile 1")
+#
+# Example on macOS:
+#   export CHROME_PROFILE_DIR="/Users/meet/Library/Application Support/Google/Chrome"
+#   export CHROME_PROFILE_NAME="Default"
+CHROME_PROFILE_DIR  = os.environ.get("CHROME_PROFILE_DIR",  "")
+CHROME_PROFILE_NAME = os.environ.get("CHROME_PROFILE_NAME", "Default")
 
-# Leicester coordinates
-CENTRE_LAT = 52.6369
-CENTRE_LON = -1.1398
-MAX_MILES  = 30
-
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))  # seconds
+CENTRE_LAT    = 52.6369
+CENTRE_LON    = -1.1398
+MAX_MILES     = 30
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
 SEEN_FILE     = "seen_jobs.json"
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
+# Session cache — skip re-auth if < 80 min since last login
+_last_auth_time: float = 0.0
+SESSION_TTL = 80 * 60
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Telegram queues (fed by background poller)
+_otp_queue:     queue.Queue = queue.Queue()
+_command_queue: queue.Queue = queue.Queue()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── BROWSER LOGIN ───────────────────────────────────────────────────────────
+# ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
-def login() -> tuple[requests.Session, str]:
-    """
-    Open a visible browser window so the user can pass the AWS WAF
-    'Let's confirm you are human' check, then auto-fill phone + PIN.
-    Returns (requests_session_with_cookies, bearer_token).
-    """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+def send_telegram(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[BOT] {text}")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:
+        log.error(f"Telegram send failed: {e}")
 
-    log.info("Opening browser window for login — a Chrome window will appear.")
-    print("\n" + "="*60)
-    print("A browser window will open.")
-    print("1. Click  'Begin'  on the security check page.")
-    print("2. The bot will then fill in your phone and PIN automatically.")
-    print("="*60 + "\n")
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=False,
-            args=["--start-maximized"],
+def _bot_update_poller():
+    """Daemon: long-polls Telegram and routes messages to the right queue."""
+    offset = None
+    # Drain stale updates so old messages don't feed as OTPs
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"timeout": 0}, timeout=10,
         )
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/147.0.0.0 Safari/537.36"
-            ),
-            locale="en-GB",
-            no_viewport=True,
-        )
-        page = ctx.new_page()
+        updates = r.json().get("result", [])
+        if updates:
+            offset = updates[-1]["update_id"] + 1
+    except Exception:
+        pass
 
-        # ── Step 0: hit main site so WAF cookies are set ─────────────────
-        page.goto("https://www.jobsatamazon.co.uk/", wait_until="domcontentloaded", timeout=30_000)
-
-        # ── Step 1: navigate to login ─────────────────────────────────────
-        page.goto(
-            "https://www.jobsatamazon.co.uk/app#/login",
-            wait_until="domcontentloaded",
-            timeout=30_000,
-        )
-
-        # ── Step 2: handle WAF "confirm you are human" page ───────────────
-        # Wait up to 60s for either the WAF page or the real login form
-        phone_sel  = 'input[type="tel"], input[name="username"], input[placeholder*="phone" i], input[placeholder*="mobile" i]'
-        waf_sel    = 'button:has-text("Begin")'
-        login_or_waf = f'{phone_sel}, {waf_sel}'
-
-        page.wait_for_selector(login_or_waf, timeout=60_000)
-
-        # If the WAF challenge appeared, wait for the user to click Begin
-        if page.locator(waf_sel).count() > 0:
-            log.info("WAF security check detected — please click 'Begin' in the browser.")
-            # Wait until the WAF page is gone and the login form appears
-            page.wait_for_selector(phone_sel, timeout=120_000)
-
-        # ── Step 3: enter phone number ────────────────────────────────────
-        log.info("Login form detected — filling in phone number...")
-        page.locator(phone_sel).first.fill(AMAZON_PHONE)
-
-        continue_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Next"), button:has-text("Sign in")'
-        page.locator(continue_sel).first.click()
-
-        # ── Step 4: enter PIN ─────────────────────────────────────────────
-        pin_sel = (
-            'input[type="password"], input[type="number"], '
-            'input[name="pin"], input[placeholder*="pin" i], '
-            'input[placeholder*="passcode" i], input[maxlength="1"]'
-        )
-        page.wait_for_selector(pin_sel, timeout=20_000)
-        log.info("PIN screen detected — entering PIN...")
-
-        pin_inputs = page.locator(pin_sel).all()
-        if len(pin_inputs) >= len(AMAZON_PIN):
-            # Individual single-digit boxes — type one digit per box
-            for i, digit in enumerate(AMAZON_PIN):
-                pin_inputs[i].click()
-                pin_inputs[i].type(digit)
-                page.wait_for_timeout(80)
-        else:
-            # Single PIN field
-            pin_inputs[0].fill(AMAZON_PIN)
-
-        verify_sel = (
-            'button[type="submit"], button:has-text("Continue"), '
-            'button:has-text("Verify"), button:has-text("Sign in"), '
-            'button:has-text("Confirm")'
-        )
-        page.locator(verify_sel).first.click()
-
-        # ── Step 5: poll for HVH_ACCESS_TOKEN (up to 30 s) ───────────────
-        log.info("Waiting for session token after PIN verification...")
-        hvh_cookie = None
-        for _ in range(30):
-            page.wait_for_timeout(1_000)
-            cookies_now = ctx.cookies()
-            hvh_cookie = next(
-                (c for c in cookies_now if c["name"] == "HVH_ACCESS_TOKEN"), None
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30}, timeout=40,
             )
-            if hvh_cookie:
-                log.info("Session token received.")
-                break
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = msg.get("text", "").strip()
+                if text.startswith("/"):
+                    _command_queue.put(text)
+                else:
+                    _otp_queue.put(text)
+        except Exception:
+            time.sleep(5)
 
-        # ── Step 6: extract all cookies then close ────────────────────────
-        all_cookies = ctx.cookies()
-        if not hvh_cookie:
-            # Save screenshot to help diagnose
-            page.screenshot(path="login_failed.png")
-            log.error("Screenshot saved to login_failed.png")
-        browser.close()
+# ─── CHROME DRIVER ───────────────────────────────────────────────────────────
 
-    hvh_cookie = next((c for c in all_cookies if c["name"] == "HVH_ACCESS_TOKEN"), None)
-    if not hvh_cookie:
-        cookie_names = [c["name"] for c in all_cookies]
-        raise RuntimeError(
-            "Login failed — HVH_ACCESS_TOKEN not found after PIN entry.\n"
-            f"Cookies present: {cookie_names}\n"
-            "Check login_failed.png to see what went wrong.\n"
-            "Also verify AMAZON_PHONE and AMAZON_PIN are correct."
+def start_driver() -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    if CHROME_PROFILE_DIR:
+        opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
+        opts.add_argument(f"--profile-directory={CHROME_PROFILE_NAME}")
+        log.info(f"Chrome profile: {CHROME_PROFILE_DIR} / {CHROME_PROFILE_NAME}")
+    else:
+        log.warning(
+            "CHROME_PROFILE_DIR not set — using a fresh profile.\n"
+            "Set it to your real Chrome profile to avoid repeated OTP prompts:\n"
+            "  export CHROME_PROFILE_DIR=\"/Users/meet/Library/Application Support/Google/Chrome\"\n"
+            "  export CHROME_PROFILE_NAME=\"Default\""
         )
 
-    bearer = unquote(hvh_cookie["value"])
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+    except Exception:
+        service = Service()  # hope chromedriver is on PATH
 
-    # Build a requests.Session pre-loaded with the browser cookies
-    session = requests.Session()
-    for c in all_cookies:
-        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+    driver = webdriver.Chrome(service=service, options=opts)
+    # Hide automation flag
+    driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    return driver
 
-    log.info("Login successful — Bearer token obtained.")
-    return session, bearer
 
-# ─── GRAPHQL JOB SEARCH ──────────────────────────────────────────────────────
+def wait_for_page_ready(driver, timeout=15):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+
+def accept_cookies_if_present(driver):
+    try:
+        btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((
+            By.XPATH,
+            '//button[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"accept all")]'
+            '| //button[@id="accept-all-cookies"]'
+            '| //button[contains(text(),"Accept All")]',
+        )))
+        btn.click()
+        log.info("Accepted cookie banner.")
+    except TimeoutException:
+        pass
+
+# ─── SESSION STATE ────────────────────────────────────────────────────────────
+
+def _mark_authenticated():
+    global _last_auth_time
+    _last_auth_time = time.time()
+    log.info("Session marked as authenticated.")
+
+
+def _is_session_probably_valid() -> bool:
+    return time.time() - _last_auth_time < SESSION_TTL
+
+
+def is_signed_in(driver) -> bool:
+    try:
+        src = driver.page_source.lower()
+        return "sign out" in src or "signout" in src or "my profile" in src
+    except Exception:
+        return False
+
+# ─── LOGIN HELPERS ────────────────────────────────────────────────────────────
+
+def _find_input(driver, keywords: list):
+    """Find a visible input whose name/id/placeholder/aria-label matches any keyword."""
+    for kw in keywords:
+        for attr in ("name", "id", "placeholder", "aria-label"):
+            xpath = (
+                f'//input[contains('
+                f'translate(@{attr},"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")'
+                f',"{kw}")]'
+            )
+            try:
+                el = driver.find_element(By.XPATH, xpath)
+                if el.is_displayed():
+                    return el
+            except Exception:
+                pass
+    return None
+
+
+def _fill(driver, element, value: str):
+    element.clear()
+    element.send_keys(value)
+
+
+def _click_continue(driver):
+    for label in ("Verify", "Continue", "Next", "Sign in", "Confirm", "Submit"):
+        try:
+            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((
+                By.XPATH,
+                f'//button[contains(text(),"{label}")] | //button[@type="submit"]',
+            )))
+            btn.click()
+            return
+        except Exception:
+            pass
+
+
+def _open_hamburger(driver) -> bool:
+    """Open the mobile nav drawer. Returns True if 'Sign in' text appears."""
+    selectors = [
+        (By.XPATH, '//*[@aria-label="Open navigation menu"]'),
+        (By.XPATH, '//*[@aria-label="menu"]'),
+        (By.CSS_SELECTOR, 'header button:first-of-type'),
+    ]
+    for by, sel in selectors:
+        try:
+            WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, sel))).click()
+            time.sleep(1)
+            if any(t in driver.page_source for t in ["Sign in", "Create account"]):
+                return True
+        except Exception:
+            pass
+    # Positional fallback: first button in top-left
+    for btn in driver.find_elements(By.TAG_NAME, "button"):
+        try:
+            loc = btn.location
+            if loc["x"] < 220 and loc["y"] < 180:
+                btn.click()
+                time.sleep(1)
+                if any(t in driver.page_source for t in ["Sign in", "Create account"]):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _click_sign_in_entry(driver):
+    try:
+        _open_hamburger(driver)
+        WebDriverWait(driver, 5).until(EC.element_to_be_clickable((
+            By.XPATH,
+            '//a[contains(text(),"Sign in")] | //button[contains(text(),"Sign in")]'
+            '| //a[contains(text(),"Login")] | //button[contains(text(),"Login")]',
+        ))).click()
+    except Exception:
+        # Force redirect so the site sends us to auth.hiring.amazon.com
+        driver.get("https://www.jobsatamazon.co.uk/app#/jobSearch")
+        time.sleep(3)
+
+
+def _select_otp_method(driver):
+    src = driver.page_source.lower()
+    if "verification code" not in src and "one-time" not in src:
+        return
+    method = AMAZON_OTP_METHOD.lower()
+    try:
+        lbl = driver.find_element(
+            By.XPATH,
+            f'//label[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{method}")]',
+        )
+        lbl.click()
+        time.sleep(0.5)
+        _click_continue(driver)
+    except Exception:
+        pass
+
+
+def _wait_for_otp_and_submit(driver, timeout=180) -> bool:
+    send_telegram(
+        f"🔐 Amazon OTP required!\n"
+        f"Reply to this message with the code — you have {timeout // 60} minutes."
+    )
+    log.info("Waiting for OTP via Telegram...")
+
+    otp = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            otp = _otp_queue.get(timeout=2)
+            break
+        except queue.Empty:
+            pass
+
+    if not otp:
+        send_telegram("⚠️ OTP timeout — login failed.")
+        return False
+
+    log.info(f"OTP received: {otp.strip()}")
+    inp = _find_input(driver, ["otp", "verification", "code", "one-time"])
+    if not inp:
+        try:
+            inp = driver.find_element(By.CSS_SELECTOR,
+                'input[type="number"], input[type="text"], input[type="tel"]')
+        except Exception:
+            pass
+
+    if inp:
+        _fill(driver, inp, otp.strip())
+        _click_continue(driver)
+        time.sleep(5)
+        if is_signed_in(driver):
+            send_telegram("✅ Sign-in successful!")
+            return True
+
+    send_telegram("⚠️ OTP entry failed.")
+    return False
+
+
+def fill_login_form(driver):
+    """Step through auth.hiring.amazon.com pages until signed in."""
+    for _ in range(12):
+        time.sleep(2)
+        url = driver.current_url.lower()
+        src = driver.page_source.lower()
+
+        # Left the auth domain → check if signed in
+        if "auth.hiring.amazon.com" not in url:
+            if is_signed_in(driver):
+                log.info("Signed in.")
+                return True
+            continue
+
+        if is_signed_in(driver):
+            return True
+
+        # OTP step
+        if "verification code" in src or "one-time" in src or " otp" in src:
+            log.info("OTP step.")
+            _select_otp_method(driver)
+            _wait_for_otp_and_submit(driver)
+            continue
+
+        # PIN step
+        if "pin" in src and ("personal" in src or "enter" in src):
+            log.info("PIN step.")
+            inp = _find_input(driver, ["pin", "personal pin", "passcode", "password"])
+            if not inp:
+                try:
+                    inp = driver.find_element(By.CSS_SELECTOR,
+                        'input[type="password"], input[type="number"]')
+                except Exception:
+                    pass
+            if inp:
+                _fill(driver, inp, AMAZON_PIN)
+                _click_continue(driver)
+            continue
+
+        # Mobile/phone step
+        if any(k in src for k in ("mobile", "phone number", "country code")):
+            log.info("Phone number step.")
+            inp = _find_input(driver, ["mobile", "phone", "telephone"])
+            if not inp:
+                try:
+                    inp = driver.find_element(By.CSS_SELECTOR,
+                        'input[type="tel"], input[type="text"]')
+                except Exception:
+                    pass
+            if inp:
+                _fill(driver, inp, AMAZON_PHONE)
+                _click_continue(driver)
+            continue
+
+        # Generic fallbacks
+        for css, value in [
+            ('input[type="password"]',            AMAZON_PIN),
+            ('input[type="tel"]',                 AMAZON_PHONE),
+            ('input[type="text"], input[type="number"]', AMAZON_PHONE),
+        ]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, css)
+                if el.is_displayed():
+                    _fill(driver, el, value)
+                    _click_continue(driver)
+                    break
+            except Exception:
+                pass
+
+    return is_signed_in(driver)
+
+
+def ensure_signed_in(driver) -> bool:
+    if is_signed_in(driver):
+        _mark_authenticated()
+        return True
+
+    send_telegram("🔄 Not signed in — starting authentication...")
+    accept_cookies_if_present(driver)
+    _click_sign_in_entry(driver)
+    time.sleep(3)
+    fill_login_form(driver)
+
+    # First wait (normal flow)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if is_signed_in(driver):
+            _mark_authenticated()
+            return True
+        time.sleep(2)
+
+    # Second wait (CAPTCHA / manual)
+    send_telegram("⚠️ Login needs help — complete it in the browser within 60 s.")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if is_signed_in(driver):
+            _mark_authenticated()
+            return True
+        time.sleep(2)
+
+    log.error("Could not sign in.")
+    return False
+
+# ─── GRAPHQL JOB FETCH ───────────────────────────────────────────────────────
 
 GRAPHQL_URL  = "https://www.jobsatamazon.co.uk/graphql"
 SEARCH_QUERY = (
@@ -175,31 +427,12 @@ SEARCH_QUERY = (
     "  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {\n"
     "    nextToken\n"
     "    jobCards {\n"
-    "      jobId\n"
-    "      jobTitle\n"
-    "      jobType\n"
-    "      employmentType\n"
-    "      city\n"
-    "      state\n"
-    "      postalCode\n"
-    "      locationName\n"
-    "      totalPayRateMin\n"
-    "      totalPayRateMax\n"
-    "      totalPayRateMinL10N\n"
-    "      totalPayRateMaxL10N\n"
-    "      tagLine\n"
-    "      distance\n"
-    "      distanceL10N\n"
-    "      scheduleCount\n"
-    "      currencyCode\n"
-    "      bonusPay\n"
-    "      bonusPayL10N\n"
-    "      bonusJob\n"
-    "      featuredJob\n"
-    "      jobTypeL10N\n"
-    "      employmentTypeL10N\n"
-    "      virtualLocation\n"
-    "      jobLocationType\n"
+    "      jobId jobTitle jobType employmentType\n"
+    "      city state postalCode locationName\n"
+    "      totalPayRateMin totalPayRateMax totalPayRateMinL10N totalPayRateMaxL10N\n"
+    "      tagLine distance distanceL10N scheduleCount currencyCode\n"
+    "      bonusPay bonusPayL10N bonusJob featuredJob\n"
+    "      jobTypeL10N employmentTypeL10N virtualLocation jobLocationType\n"
     "    }\n"
     "    __typename\n"
     "  }\n"
@@ -207,53 +440,56 @@ SEARCH_QUERY = (
 )
 
 
-def fetch_jobs(session: requests.Session, bearer: str) -> list:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type":    "application/json",
-        "Authorization":   f"Bearer {bearer}",
-        "country":         "United Kingdom",
-        "iscanary":        "false",
-        "Origin":          "https://www.jobsatamazon.co.uk",
-        "Referer":         "https://www.jobsatamazon.co.uk/app",
-    }
-    payload = {
-        "operationName": "searchJobCardsByLocation",
-        "variables": {
-            "searchJobRequest": {
-                "locale":         "en-GB",
-                "country":        "United Kingdom",
-                "keyWords":       "",
-                "equalFilters":   [],
-                "containFilters": [{"key": "isPrivateSchedule", "val": ["true", "false"]}],
-                "rangeFilters":   [],
-                "orFilters":      [],
-                "dateFilters":    [],
-                "sorters":        [],
-                "pageSize":       100,
-                "geoQueryClause": {
-                    "lat":      CENTRE_LAT,
-                    "lng":      CENTRE_LON,
-                    "unit":     "mi",
-                    "distance": MAX_MILES,
-                },
-                "consolidateSchedule": True,
-            }
+def fetch_jobs(driver) -> list:
+    # Copy browser cookies + bearer token into a requests session
+    bearer  = ""
+    session = requests.Session()
+    for c in driver.get_cookies():
+        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+        if c["name"] == "HVH_ACCESS_TOKEN":
+            bearer = unquote(c["value"])
+
+    resp = session.post(
+        GRAPHQL_URL,
+        json={
+            "operationName": "searchJobCardsByLocation",
+            "variables": {
+                "searchJobRequest": {
+                    "locale":         "en-GB",
+                    "country":        "United Kingdom",
+                    "keyWords":       "",
+                    "equalFilters":   [],
+                    "containFilters": [{"key": "isPrivateSchedule", "val": ["true", "false"]}],
+                    "rangeFilters":   [],
+                    "orFilters":      [],
+                    "dateFilters":    [],
+                    "sorters":        [],
+                    "pageSize":       100,
+                    "geoQueryClause": {
+                        "lat": CENTRE_LAT, "lng": CENTRE_LON,
+                        "unit": "mi", "distance": MAX_MILES,
+                    },
+                    "consolidateSchedule": True,
+                }
+            },
+            "query": SEARCH_QUERY,
         },
-        "query": SEARCH_QUERY,
-    }
-    resp = session.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
+        headers={
+            "User-Agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "Accept":        "*/*",
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {bearer}",
+            "country":       "United Kingdom",
+            "iscanary":      "false",
+            "Origin":        "https://www.jobsatamazon.co.uk",
+            "Referer":       "https://www.jobsatamazon.co.uk/app",
+        },
+        timeout=30,
+    )
     resp.raise_for_status()
-    data = resp.json()
-    if "errors" in data:
-        log.warning(f"GraphQL errors: {data['errors']}")
     return (
-        data.get("data", {})
+        resp.json()
+            .get("data", {})
             .get("searchJobCardsByLocation", {})
             .get("jobCards", [])
     )
@@ -271,122 +507,87 @@ def save_seen(seen: set):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
+# ─── ALERTS ──────────────────────────────────────────────────────────────────
 
 def format_job(job: dict) -> str:
     lines = []
-
-    loc_parts = [p for p in [
-        job.get("locationName"),
-        job.get("city"),
-        job.get("state"),
-        job.get("postalCode"),
-    ] if p]
-    lines.append(f"📍 {', '.join(loc_parts)}")
-
+    loc = ", ".join(filter(None, [
+        job.get("locationName"), job.get("city"),
+        job.get("state"), job.get("postalCode"),
+    ]))
+    lines.append(f"📍 {loc}")
     lines.append(f"🏷️ {job.get('jobTitle') or 'Warehouse Operative'}")
-
     contract = " | ".join(filter(None, [job.get("jobTypeL10N"), job.get("employmentTypeL10N")]))
     if contract:
         lines.append(f"💼 {contract}")
-
     if job.get("tagLine"):
         lines.append(f"💬 {job['tagLine'][:100]}")
-
     pay_min = job.get("totalPayRateMinL10N") or job.get("totalPayRateMin")
     pay_max = job.get("totalPayRateMaxL10N") or job.get("totalPayRateMax")
     if pay_min and pay_max and str(pay_min) != str(pay_max):
         lines.append(f"💰 {pay_min} – {pay_max} /hr")
     elif pay_min:
         lines.append(f"💰 {pay_min} /hr")
-
     if job.get("bonusPay"):
         lines.append(f"🎁 Bonus: {job.get('bonusPayL10N') or job['bonusPay']}")
-
     dist = job.get("distanceL10N") or job.get("distance")
     if dist:
         lines.append(f"📏 {dist} away")
-
     if job.get("scheduleCount"):
         lines.append(f"📅 {job['scheduleCount']} schedule(s) available")
-
-    job_id = job.get("jobId", "")
-    lines.append(f"🔗 https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}")
-
+    lines.append(f"🔗 https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job.get('jobId','')}")
     return "\n".join(lines)
 
 
-def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — printing to console:")
-        print(text)
-        print()
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            "chat_id":                  TELEGRAM_CHAT_ID,
-            "text":                     text,
-            "parse_mode":               "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=10)
-        r.raise_for_status()
-        log.info("Telegram message sent.")
-    except Exception as e:
-        log.error(f"Telegram send failed: {e}")
-
-
 def send_combined_alert(jobs: list):
-    header    = f"🆕 <b>{len(jobs)} new Amazon warehouse job(s) near Leicester!</b>\n"
+    header    = f"🆕 {len(jobs)} new Amazon warehouse job(s) near Leicester!\n"
     separator = "\n" + "─" * 30 + "\n"
     blocks    = [format_job(j) for j in jobs]
-
     messages, current = [], header
     for i, block in enumerate(blocks):
         chunk = (separator if i > 0 else "\n") + block
         if len(current) + len(chunk) > 4000:
             messages.append(current)
-            current = f"🆕 <b>Continued ({i+1}/{len(blocks)})</b>\n\n" + block
+            current = f"🆕 Continued ({i+1}/{len(blocks)})\n\n" + block
         else:
             current += chunk
     messages.append(current)
-
     for msg in messages:
         send_telegram(msg)
         time.sleep(0.3)
 
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 
-def check_once(
-    session: requests.Session,
-    bearer:  str,
-    seen:    set,
-) -> tuple[set, requests.Session, str]:
+def check_once(driver, seen: set) -> set:
     log.info("Checking for new jobs...")
+    if not _is_session_probably_valid():
+        driver.get("https://www.jobsatamazon.co.uk/")
+        wait_for_page_ready(driver)
+        accept_cookies_if_present(driver)
+        ensure_signed_in(driver)
+
     try:
-        jobs = fetch_jobs(session, bearer)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (401, 403):
-            log.warning("Token expired — re-logging in...")
-            session, bearer = login()
-            jobs = fetch_jobs(session, bearer)
-        else:
-            raise
+        jobs = fetch_jobs(driver)
+    except Exception as e:
+        log.warning(f"Fetch failed ({e}) — re-authenticating...")
+        driver.get("https://www.jobsatamazon.co.uk/")
+        wait_for_page_ready(driver)
+        ensure_signed_in(driver)
+        jobs = fetch_jobs(driver)
 
-    log.info(f"Fetched {len(jobs)} job(s) from API.")
-
+    log.info(f"Fetched {len(jobs)} job(s).")
     new_jobs = [j for j in jobs if j.get("jobId") and j["jobId"] not in seen]
     for j in new_jobs:
         seen.add(j["jobId"])
 
     if new_jobs:
-        log.info(f"Found {len(new_jobs)} new job(s)! Sending alert...")
+        log.info(f"{len(new_jobs)} new job(s) — alerting.")
         send_combined_alert(new_jobs)
     else:
-        log.info("No new jobs found.")
+        log.info("No new jobs.")
 
     save_seen(seen)
-    return seen, session, bearer
+    return seen
 
 
 def main():
@@ -394,37 +595,45 @@ def main():
 
     if not AMAZON_PHONE or not AMAZON_PIN:
         log.error(
-            "AMAZON_PHONE and AMAZON_PIN must be set.\n"
+            "Set AMAZON_PHONE and AMAZON_PIN.\n"
             "  export AMAZON_PHONE='+447XXXXXXXXX'\n"
             "  export AMAZON_PIN='XXXXXX'"
         )
         return
 
     if not TELEGRAM_TOKEN:
-        log.warning("TELEGRAM_TOKEN not set — messages will print to console.")
+        log.warning("TELEGRAM_TOKEN not set — alerts will print to console.")
     if not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_CHAT_ID not set — messages will print to console.")
+        log.warning("TELEGRAM_CHAT_ID not set — alerts will print to console.")
+    elif TELEGRAM_TOKEN:
+        threading.Thread(target=_bot_update_poller, daemon=True).start()
+        log.info("Telegram OTP poller started.")
 
     seen = load_seen()
     log.info(f"Loaded {len(seen)} previously seen job(s).")
 
-    session, bearer = login()
+    driver = start_driver()
+    try:
+        driver.get("https://www.jobsatamazon.co.uk/")
+        wait_for_page_ready(driver)
+        accept_cookies_if_present(driver)
+        ensure_signed_in(driver)
 
-    send_telegram(
-        f"🤖 <b>Amazon Job Alert Bot Started</b>\n\n"
-        f"📍 Watching jobs within <b>{MAX_MILES} miles</b> of Leicester\n"
-        f"🔄 Checking every <b>{POLL_INTERVAL // 60} min</b>\n"
-        "📬 You'll be notified the moment new jobs appear! 🚀"
-    )
+        send_telegram(
+            f"🤖 Amazon Job Alert Bot Started\n"
+            f"📍 Within {MAX_MILES} miles of Leicester\n"
+            f"🔄 Checking every {POLL_INTERVAL // 60} min"
+        )
 
-    while True:
-        try:
-            seen, session, bearer = check_once(session, bearer, seen)
-        except Exception as e:
-            log.error(f"Unexpected error in main loop: {e}")
-
-        log.info(f"Sleeping {POLL_INTERVAL}s until next check...")
-        time.sleep(POLL_INTERVAL)
+        while True:
+            try:
+                seen = check_once(driver, seen)
+            except Exception as e:
+                log.error(f"Loop error: {e}")
+            log.info(f"Sleeping {POLL_INTERVAL}s...")
+            time.sleep(POLL_INTERVAL)
+    finally:
+        driver.quit()
 
 
 if __name__ == "__main__":
