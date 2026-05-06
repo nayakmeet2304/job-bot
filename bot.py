@@ -1,7 +1,7 @@
 """
 Amazon UK Warehouse Job Alert Bot
-Authenticates with jobsatamazon.co.uk and polls the GraphQL API
-for new warehouse jobs near Leicester.
+Uses a headless browser (Playwright) to log in to jobsatamazon.co.uk,
+then polls the GraphQL API for new warehouse jobs near Leicester.
 """
 
 import os
@@ -9,20 +9,20 @@ import json
 import time
 import logging
 import requests
+from urllib.parse import unquote
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Your jobsatamazon.co.uk login credentials
-AMAZON_PHONE = os.environ.get("AMAZON_PHONE", "")   # e.g. +447352697050
-AMAZON_PIN   = os.environ.get("AMAZON_PIN",   "")   # your static PIN
+AMAZON_PHONE = os.environ.get("AMAZON_PHONE", "")  # e.g. +447352697050
+AMAZON_PIN   = os.environ.get("AMAZON_PIN",   "")  # your static PIN
 
 # Leicester coordinates
 CENTRE_LAT = 52.6369
 CENTRE_LON = -1.1398
-MAX_MILES  = 30  # search radius in miles
+MAX_MILES  = 30
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))  # seconds
 SEEN_FILE     = "seen_jobs.json"
@@ -35,133 +35,96 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── AUTHENTICATION ──────────────────────────────────────────────────────────
-
-BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/147.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/json",
-    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
-
-
-def _step1_request_sign_in(session: requests.Session) -> str:
-    """
-    POST to /sign-in with phone number.
-    Amazon returns a short-lived KMS-signed JWT that acts as a CSRF token
-    for the PIN verification step.
-    """
-    url = "https://auth.hiring.amazon.com/api/authentication/sign-in"
-    headers = {
-        **BASE_HEADERS,
-        "Origin":  "https://auth.hiring.amazon.com",
-        "Referer": "https://auth.hiring.amazon.com/",
-    }
-    resp = session.post(
-        url,
-        json={"user": AMAZON_PHONE, "countryCode": "UK"},
-        headers=headers,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    token = (
-        data.get("token")
-        or data.get("csrfToken")
-        or data.get("sessionToken")
-        or data.get("authToken")
-    )
-    if not token:
-        raise RuntimeError(f"No token in sign-in response: {data}")
-    log.info("Step 1 OK — got sign-in token.")
-    return token
-
-
-def _step2_verify_pin(session: requests.Session, csrf_token: str) -> str:
-    """
-    POST to /verify-sign-in with phone + PIN + CSRF token.
-    Returns the Bearer token (HVH_ACCESS_TOKEN).
-    """
-    url = "https://auth.hiring.amazon.com/api/authentication/verify-sign-in?countryCode=UK"
-    headers = {
-        **BASE_HEADERS,
-        "Origin":     "https://auth.hiring.amazon.com",
-        "Referer":    "https://auth.hiring.amazon.com/",
-        "CSRF-Token": csrf_token,
-    }
-    resp = session.post(
-        url,
-        json={
-            "user":        AMAZON_PHONE,
-            "pin":         AMAZON_PIN,
-            "token":       csrf_token,
-            "countryName": "United Kingdom",
-        },
-        headers=headers,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    log.debug(f"verify-sign-in response: {data}")
-
-    # Bearer token may be in the response body or in the Set-Cookie header
-    bearer = (
-        data.get("accessToken")
-        or data.get("token")
-        or data.get("sessionToken")
-        or data.get("authToken")
-    )
-    if not bearer:
-        # Fall back to checking cookies (HVH_ACCESS_TOKEN cookie)
-        raw = session.cookies.get("HVH_ACCESS_TOKEN")
-        if raw:
-            from urllib.parse import unquote
-            bearer = unquote(raw)
-
-    if not bearer:
-        raise RuntimeError(
-            f"Could not extract Bearer token from verify-sign-in.\n"
-            f"Response body: {data}\n"
-            f"Cookies: {dict(session.cookies)}"
-        )
-
-    log.info("Step 2 OK — authenticated.")
-    return bearer
-
+# ─── BROWSER LOGIN ───────────────────────────────────────────────────────────
 
 def login() -> tuple[requests.Session, str]:
-    """Full login flow. Returns (session, bearer_token)."""
-    session = requests.Session()
-    # Visit the auth page first so the WAF / session cookies are set
-    try:
-        session.get(
-            "https://auth.hiring.amazon.com/",
-            headers={**BASE_HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
-            timeout=10,
-        )
-    except Exception:
-        pass  # best-effort; carry on
+    """
+    Use a headless Chromium browser to complete the phone+PIN login on
+    auth.hiring.amazon.com.  This lets AWS WAF's JS challenge run normally.
+    Returns (requests_session_with_cookies, bearer_token).
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    log.info("Logging in to jobsatamazon.co.uk...")
-    csrf_token = _step1_request_sign_in(session)
-    bearer     = _step2_verify_pin(session, csrf_token)
+    log.info("Launching headless browser for login...")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/147.0.0.0 Safari/537.36"
+            ),
+            locale="en-GB",
+        )
+        page = ctx.new_page()
+
+        # ── Step 0: hit main site so WAF cookies are set ─────────────────
+        page.goto("https://www.jobsatamazon.co.uk/", wait_until="domcontentloaded", timeout=30_000)
+
+        # ── Step 1: navigate to login ─────────────────────────────────────
+        page.goto(
+            "https://www.jobsatamazon.co.uk/app#/login",
+            wait_until="networkidle",
+            timeout=30_000,
+        )
+
+        # ── Step 2: enter phone number ────────────────────────────────────
+        phone_sel = 'input[type="tel"], input[name="username"], input[placeholder*="phone" i], input[placeholder*="mobile" i]'
+        try:
+            page.wait_for_selector(phone_sel, timeout=15_000)
+        except PWTimeout:
+            # Sometimes the page redirects to auth.hiring.amazon.com directly
+            page.goto("https://auth.hiring.amazon.com/#/login", wait_until="networkidle", timeout=20_000)
+            page.wait_for_selector(phone_sel, timeout=15_000)
+
+        page.locator(phone_sel).first.fill(AMAZON_PHONE)
+
+        # Click the "Continue" / "Next" / "Send" button
+        continue_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Next"), button:has-text("Sign in")'
+        page.locator(continue_sel).first.click()
+
+        # ── Step 3: enter PIN ─────────────────────────────────────────────
+        pin_sel = 'input[type="password"], input[type="number"], input[name="pin"], input[placeholder*="pin" i], input[placeholder*="passcode" i]'
+        page.wait_for_selector(pin_sel, timeout=15_000)
+        page.locator(pin_sel).first.fill(AMAZON_PIN)
+
+        verify_sel = 'button[type="submit"], button:has-text("Continue"), button:has-text("Verify"), button:has-text("Sign in"), button:has-text("Confirm")'
+        page.locator(verify_sel).first.click()
+
+        # ── Step 4: wait until we're back on the main site ───────────────
+        try:
+            page.wait_for_url("**/jobsatamazon.co.uk/**", timeout=30_000)
+        except PWTimeout:
+            # Might land on auth domain; wait for the HVH cookie to appear
+            page.wait_for_timeout(5_000)
+
+        # ── Step 5: extract cookies ───────────────────────────────────────
+        all_cookies = ctx.cookies()
+        browser.close()
+
+    hvh = next((c for c in all_cookies if c["name"] == "HVH_ACCESS_TOKEN"), None)
+    if not hvh:
+        cookie_names = [c["name"] for c in all_cookies]
+        raise RuntimeError(
+            f"Login failed — HVH_ACCESS_TOKEN not found in cookies.\n"
+            f"Cookies present: {cookie_names}\n"
+            "Check AMAZON_PHONE and AMAZON_PIN are correct."
+        )
+
+    bearer = unquote(hvh["value"])
+
+    # Build a requests.Session pre-loaded with the browser cookies
+    session = requests.Session()
+    for c in all_cookies:
+        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+
+    log.info("Login successful — Bearer token obtained.")
     return session, bearer
 
 # ─── GRAPHQL JOB SEARCH ──────────────────────────────────────────────────────
 
-GRAPHQL_URL = "https://www.jobsatamazon.co.uk/graphql"
-
-# Exact query the site uses
+GRAPHQL_URL  = "https://www.jobsatamazon.co.uk/graphql"
 SEARCH_QUERY = (
     "query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {\n"
     "  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {\n"
@@ -201,21 +164,26 @@ SEARCH_QUERY = (
 
 def fetch_jobs(session: requests.Session, bearer: str) -> list:
     headers = {
-        **BASE_HEADERS,
-        "Authorization": f"Bearer {bearer}",
-        "country":       "United Kingdom",
-        "iscanary":      "false",
-        "Origin":        "https://www.jobsatamazon.co.uk",
-        "Referer":       "https://www.jobsatamazon.co.uk/app",
-        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type":    "application/json",
+        "Authorization":   f"Bearer {bearer}",
+        "country":         "United Kingdom",
+        "iscanary":        "false",
+        "Origin":          "https://www.jobsatamazon.co.uk",
+        "Referer":         "https://www.jobsatamazon.co.uk/app",
     }
     payload = {
         "operationName": "searchJobCardsByLocation",
         "variables": {
             "searchJobRequest": {
-                "locale":   "en-GB",
-                "country":  "United Kingdom",
-                "keyWords": "",
+                "locale":         "en-GB",
+                "country":        "United Kingdom",
+                "keyWords":       "",
                 "equalFilters":   [],
                 "containFilters": [{"key": "isPrivateSchedule", "val": ["true", "false"]}],
                 "rangeFilters":   [],
@@ -237,10 +205,8 @@ def fetch_jobs(session: requests.Session, bearer: str) -> list:
     resp = session.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-
     if "errors" in data:
         log.warning(f"GraphQL errors: {data['errors']}")
-
     return (
         data.get("data", {})
             .get("searchJobCardsByLocation", {})
@@ -312,14 +278,13 @@ def send_telegram(text: str):
         print()
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":                  TELEGRAM_CHAT_ID,
-        "text":                     text,
-        "parse_mode":               "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json={
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "text":                     text,
+            "parse_mode":               "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
         r.raise_for_status()
         log.info("Telegram message sent.")
     except Exception as e:
@@ -327,12 +292,11 @@ def send_telegram(text: str):
 
 
 def send_combined_alert(jobs: list):
-    header = f"🆕 <b>{len(jobs)} new Amazon warehouse job(s) near Leicester!</b>\n"
+    header    = f"🆕 <b>{len(jobs)} new Amazon warehouse job(s) near Leicester!</b>\n"
     separator = "\n" + "─" * 30 + "\n"
-    blocks = [format_job(j) for j in jobs]
+    blocks    = [format_job(j) for j in jobs]
 
-    messages = []
-    current = header
+    messages, current = [], header
     for i, block in enumerate(blocks):
         chunk = (separator if i > 0 else "\n") + block
         if len(current) + len(chunk) > 4000:
@@ -350,15 +314,15 @@ def send_combined_alert(jobs: list):
 
 def check_once(
     session: requests.Session,
-    bearer: str,
-    seen: set,
+    bearer:  str,
+    seen:    set,
 ) -> tuple[set, requests.Session, str]:
     log.info("Checking for new jobs...")
     try:
         jobs = fetch_jobs(session, bearer)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
-            log.warning("Session expired — re-logging in...")
+            log.warning("Token expired — re-logging in...")
             session, bearer = login()
             jobs = fetch_jobs(session, bearer)
         else:
