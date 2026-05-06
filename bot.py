@@ -1,32 +1,31 @@
 """
 Amazon UK Warehouse Job Alert Bot
-Scrapes jobsatamazon.co.uk and sends Telegram notifications
-for new jobs within ~150 miles of Leicester.
+Authenticates with jobsatamazon.co.uk and polls the GraphQL API
+for new warehouse jobs near Leicester.
 """
 
 import os
 import json
 import time
-import math
 import logging
 import requests
-from datetime import datetime
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Your jobsatamazon.co.uk login credentials
+AMAZON_PHONE = os.environ.get("AMAZON_PHONE", "")   # e.g. +447352697050
+AMAZON_PIN   = os.environ.get("AMAZON_PIN",   "")   # your static PIN
 
 # Leicester coordinates
 CENTRE_LAT = 52.6369
 CENTRE_LON = -1.1398
-MAX_MILES = 150
+MAX_MILES  = 30  # search radius in miles
 
-# How often to check (seconds). 300 = every 5 mins
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
-
-# File to track jobs we've already seen
-SEEN_FILE = "seen_jobs.json"
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))  # seconds
+SEEN_FILE     = "seen_jobs.json"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -36,19 +35,221 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
+# ─── AUTHENTICATION ──────────────────────────────────────────────────────────
 
-def haversine_miles(lat1, lon1, lat2, lon2):
-    """Calculate distance in miles between two lat/lon points."""
-    R = 3958.8  # Earth radius in miles
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/147.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
 
 
-def load_seen():
+def _step1_request_sign_in(session: requests.Session) -> str:
+    """
+    POST to /sign-in with phone number.
+    Amazon returns a short-lived KMS-signed JWT that acts as a CSRF token
+    for the PIN verification step.
+    """
+    url = "https://auth.hiring.amazon.com/api/authentication/sign-in"
+    headers = {
+        **BASE_HEADERS,
+        "Origin":  "https://auth.hiring.amazon.com",
+        "Referer": "https://auth.hiring.amazon.com/",
+    }
+    resp = session.post(
+        url,
+        json={"user": AMAZON_PHONE, "countryCode": "UK"},
+        headers=headers,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    token = (
+        data.get("token")
+        or data.get("csrfToken")
+        or data.get("sessionToken")
+        or data.get("authToken")
+    )
+    if not token:
+        raise RuntimeError(f"No token in sign-in response: {data}")
+    log.info("Step 1 OK — got sign-in token.")
+    return token
+
+
+def _step2_verify_pin(session: requests.Session, csrf_token: str) -> str:
+    """
+    POST to /verify-sign-in with phone + PIN + CSRF token.
+    Returns the Bearer token (HVH_ACCESS_TOKEN).
+    """
+    url = "https://auth.hiring.amazon.com/api/authentication/verify-sign-in?countryCode=UK"
+    headers = {
+        **BASE_HEADERS,
+        "Origin":     "https://auth.hiring.amazon.com",
+        "Referer":    "https://auth.hiring.amazon.com/",
+        "CSRF-Token": csrf_token,
+    }
+    resp = session.post(
+        url,
+        json={
+            "user":        AMAZON_PHONE,
+            "pin":         AMAZON_PIN,
+            "token":       csrf_token,
+            "countryName": "United Kingdom",
+        },
+        headers=headers,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    log.debug(f"verify-sign-in response: {data}")
+
+    # Bearer token may be in the response body or in the Set-Cookie header
+    bearer = (
+        data.get("accessToken")
+        or data.get("token")
+        or data.get("sessionToken")
+        or data.get("authToken")
+    )
+    if not bearer:
+        # Fall back to checking cookies (HVH_ACCESS_TOKEN cookie)
+        raw = session.cookies.get("HVH_ACCESS_TOKEN")
+        if raw:
+            from urllib.parse import unquote
+            bearer = unquote(raw)
+
+    if not bearer:
+        raise RuntimeError(
+            f"Could not extract Bearer token from verify-sign-in.\n"
+            f"Response body: {data}\n"
+            f"Cookies: {dict(session.cookies)}"
+        )
+
+    log.info("Step 2 OK — authenticated.")
+    return bearer
+
+
+def login() -> tuple[requests.Session, str]:
+    """Full login flow. Returns (session, bearer_token)."""
+    session = requests.Session()
+    # Visit the auth page first so the WAF / session cookies are set
+    try:
+        session.get(
+            "https://auth.hiring.amazon.com/",
+            headers={**BASE_HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
+            timeout=10,
+        )
+    except Exception:
+        pass  # best-effort; carry on
+
+    log.info("Logging in to jobsatamazon.co.uk...")
+    csrf_token = _step1_request_sign_in(session)
+    bearer     = _step2_verify_pin(session, csrf_token)
+    return session, bearer
+
+# ─── GRAPHQL JOB SEARCH ──────────────────────────────────────────────────────
+
+GRAPHQL_URL = "https://www.jobsatamazon.co.uk/graphql"
+
+# Exact query the site uses
+SEARCH_QUERY = (
+    "query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {\n"
+    "  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {\n"
+    "    nextToken\n"
+    "    jobCards {\n"
+    "      jobId\n"
+    "      jobTitle\n"
+    "      jobType\n"
+    "      employmentType\n"
+    "      city\n"
+    "      state\n"
+    "      postalCode\n"
+    "      locationName\n"
+    "      totalPayRateMin\n"
+    "      totalPayRateMax\n"
+    "      totalPayRateMinL10N\n"
+    "      totalPayRateMaxL10N\n"
+    "      tagLine\n"
+    "      distance\n"
+    "      distanceL10N\n"
+    "      scheduleCount\n"
+    "      currencyCode\n"
+    "      bonusPay\n"
+    "      bonusPayL10N\n"
+    "      bonusJob\n"
+    "      featuredJob\n"
+    "      jobTypeL10N\n"
+    "      employmentTypeL10N\n"
+    "      virtualLocation\n"
+    "      jobLocationType\n"
+    "    }\n"
+    "    __typename\n"
+    "  }\n"
+    "}\n"
+)
+
+
+def fetch_jobs(session: requests.Session, bearer: str) -> list:
+    headers = {
+        **BASE_HEADERS,
+        "Authorization": f"Bearer {bearer}",
+        "country":       "United Kingdom",
+        "iscanary":      "false",
+        "Origin":        "https://www.jobsatamazon.co.uk",
+        "Referer":       "https://www.jobsatamazon.co.uk/app",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    payload = {
+        "operationName": "searchJobCardsByLocation",
+        "variables": {
+            "searchJobRequest": {
+                "locale":   "en-GB",
+                "country":  "United Kingdom",
+                "keyWords": "",
+                "equalFilters":   [],
+                "containFilters": [{"key": "isPrivateSchedule", "val": ["true", "false"]}],
+                "rangeFilters":   [],
+                "orFilters":      [],
+                "dateFilters":    [],
+                "sorters":        [],
+                "pageSize":       100,
+                "geoQueryClause": {
+                    "lat":      CENTRE_LAT,
+                    "lng":      CENTRE_LON,
+                    "unit":     "mi",
+                    "distance": MAX_MILES,
+                },
+                "consolidateSchedule": True,
+            }
+        },
+        "query": SEARCH_QUERY,
+    }
+    resp = session.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "errors" in data:
+        log.warning(f"GraphQL errors: {data['errors']}")
+
+    return (
+        data.get("data", {})
+            .get("searchJobCardsByLocation", {})
+            .get("jobCards", [])
+    )
+
+# ─── SEEN JOBS ───────────────────────────────────────────────────────────────
+
+def load_seen() -> set:
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
             return set(json.load(f))
@@ -59,209 +260,62 @@ def save_seen(seen: set):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
-
-# ─── AMAZON JOBS FETCHER ─────────────────────────────────────────────────────
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Origin": "https://www.jobsatamazon.co.uk",
-    "Referer": "https://www.jobsatamazon.co.uk/",
-}
-
-# The internal API used by the jobsatamazon.co.uk React app
-API_URL = "https://hiring.amazon.co.uk/api/v1/search"
-
-PAYLOAD = {
-    "locale": "en-GB",
-    "country": "GBR",
-    "keyWords": "",
-    "equalFilters": [],
-    "containFilters": [{"key": "normalizedJobCode", "val": ["AMZL", "FC", "SC", "RS"]}],
-    "rangeFilters": [],
-    "orFilters": [],
-    "pageSize": 100,
-    "geoQueryClause": {
-        "lat": CENTRE_LAT,
-        "lng": CENTRE_LON,
-        "unit": "mi",
-        "distance": MAX_MILES,
-    },
-    "offset": 0,
-    "total": True,
-    "eventSource": "JOB_SEARCH_PAGE",
-}
-
-
-def fetch_jobs():
-    """Call the Amazon internal jobs API and return list of job dicts."""
-    try:
-        resp = requests.post(
-            API_URL,
-            json=PAYLOAD,
-            headers=HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("jobs", [])
-    except requests.exceptions.HTTPError as e:
-        log.warning(f"HTTP error fetching jobs: {e}")
-        # Fallback: try alternative endpoint
-        return fetch_jobs_fallback()
-    except Exception as e:
-        log.error(f"Error fetching jobs: {e}")
-        return []
-
-
-ALT_API_URL = "https://www.jobsatamazon.co.uk/api/search"
-
-def fetch_jobs_fallback():
-    """Fallback to alternative API endpoint."""
-    try:
-        params = {
-            "locale": "en-GB",
-            "country": "GBR",
-            "radius": MAX_MILES,
-            "latitude": CENTRE_LAT,
-            "longitude": CENTRE_LON,
-            "pageSize": 100,
-        }
-        resp = requests.get(ALT_API_URL, params=params, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("jobs", data.get("results", []))
-    except Exception as e:
-        log.error(f"Fallback also failed: {e}")
-        return []
-
-
-def parse_job(job: dict) -> dict | None:
-    """Normalise a raw job dict into something we can work with."""
-    try:
-        job_id = (
-            job.get("jobId")
-            or job.get("id")
-            or job.get("requisitionId")
-            or ""
-        )
-        if not job_id:
-            return None
-
-        title = job.get("title") or job.get("jobTitle") or "Warehouse Operative"
-        city = job.get("city") or job.get("locationName") or ""
-        state = job.get("state") or job.get("region") or "England"
-        postal = job.get("postalCode") or job.get("zipCode") or ""
-        pay = (
-            job.get("pay")
-            or job.get("basePay")
-            or job.get("hourlyPay")
-            or ""
-        )
-        employment_type = job.get("employmentType") or job.get("jobType") or ""
-        schedule_type = job.get("scheduleType") or ""
-        description = job.get("jobDescription") or job.get("description") or "Pick, pack and ship parcels"
-        first_day = job.get("firstDayOnSite") or job.get("startDate") or ""
-        schedule = job.get("shiftCode") or job.get("schedule") or ""
-        hours = job.get("hoursPerWeek") or ""
-        openings = job.get("totalOpenings") or job.get("openings") or 1
-
-        # Location coordinates for distance check
-        lat = job.get("latitude") or job.get("lat")
-        lon = job.get("longitude") or job.get("lng") or job.get("lon")
-        if lat and lon:
-            dist = haversine_miles(CENTRE_LAT, CENTRE_LON, float(lat), float(lon))
-            if dist > MAX_MILES:
-                return None  # outside range
-
-        url = (
-            job.get("applyUrl")
-            or job.get("url")
-            or f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}"
-        )
-
-        # Format pay nicely
-        if pay and not str(pay).startswith("£"):
-            try:
-                pay = f"£{float(pay):.2f} /hr"
-            except Exception:
-                pass
-
-        return {
-            "job_id": job_id,
-            "title": title,
-            "city": city,
-            "state": state,
-            "postal": postal,
-            "pay": pay,
-            "employment_type": employment_type,
-            "schedule_type": schedule_type,
-            "description": description,
-            "first_day": first_day,
-            "schedule": schedule,
-            "hours": hours,
-            "openings": openings,
-            "url": url,
-        }
-    except Exception as e:
-        log.warning(f"Error parsing job: {e}")
-        return None
-
-
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
-def format_message(job: dict) -> str:
-    """Format job dict into the Telegram message style you showed."""
+def format_job(job: dict) -> str:
     lines = []
 
-    location_parts = [p for p in [job["city"], job["state"], job["postal"]] if p]
-    lines.append(f"📍 {', '.join(location_parts)}")
+    loc_parts = [p for p in [
+        job.get("locationName"),
+        job.get("city"),
+        job.get("state"),
+        job.get("postalCode"),
+    ] if p]
+    lines.append(f"📍 {', '.join(loc_parts)}")
 
-    openings = job["openings"]
-    lines.append(f"🏷️ {job['title']} | {openings}")
+    lines.append(f"🏷️ {job.get('jobTitle') or 'Warehouse Operative'}")
 
-    contract_parts = [p for p in [job["schedule_type"], job["employment_type"]] if p]
-    if contract_parts:
-        lines.append(f"💼 {' | '.join(contract_parts)}")
+    contract = " | ".join(filter(None, [job.get("jobTypeL10N"), job.get("employmentTypeL10N")]))
+    if contract:
+        lines.append(f"💼 {contract}")
 
-    if job["description"]:
-        desc = job["description"][:80].strip()
-        lines.append(f"💬 {desc}")
+    if job.get("tagLine"):
+        lines.append(f"💬 {job['tagLine'][:100]}")
 
-    if job["pay"]:
-        lines.append(f"💰 {job['pay']}")
+    pay_min = job.get("totalPayRateMinL10N") or job.get("totalPayRateMin")
+    pay_max = job.get("totalPayRateMaxL10N") or job.get("totalPayRateMax")
+    if pay_min and pay_max and str(pay_min) != str(pay_max):
+        lines.append(f"💰 {pay_min} – {pay_max} /hr")
+    elif pay_min:
+        lines.append(f"💰 {pay_min} /hr")
 
-    if job["first_day"]:
-        lines.append(f"📅 First Day: {job['first_day']}")
+    if job.get("bonusPay"):
+        lines.append(f"🎁 Bonus: {job.get('bonusPayL10N') or job['bonusPay']}")
 
-    if job["schedule"]:
-        lines.append(f"⏰ Schedule: {job['schedule']}")
+    dist = job.get("distanceL10N") or job.get("distance")
+    if dist:
+        lines.append(f"📏 {dist} away")
 
-    if job["hours"]:
-        lines.append(f"🕐 Hours/Week: {job['hours']}")
+    if job.get("scheduleCount"):
+        lines.append(f"📅 {job['scheduleCount']} schedule(s) available")
 
-    lines.append(f"🔗 {job['url']}")
+    job_id = job.get("jobId", "")
+    lines.append(f"🔗 https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}")
 
     return "\n".join(lines)
 
 
 def send_telegram(text: str):
-    """Send a message via Telegram Bot API."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — printing to console instead:")
+        log.warning("Telegram not configured — printing to console:")
         print(text)
+        print()
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
+        "chat_id":                  TELEGRAM_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
     try:
@@ -272,87 +326,91 @@ def send_telegram(text: str):
         log.error(f"Telegram send failed: {e}")
 
 
-def send_startup_message():
-    msg = (
-        "🤖 <b>Amazon Job Alert Bot Started</b>\n\n"
-        f"📍 Watching for jobs within <b>{MAX_MILES} miles</b> of Leicester\n"
-        f"🔄 Checking every <b>{POLL_INTERVAL // 60} minutes</b>\n"
-        "📬 All new jobs sent in <b>one combined message</b>\n\n"
-        "Sit back — you'll be notified the moment new jobs appear! 🚀"
-    )
-    send_telegram(msg)
-
-
-# ─── MAIN LOOP ───────────────────────────────────────────────────────────────
-
-def check_once(seen: set) -> set:
-    """Fetch jobs, filter new ones, send ONE combined alert. Returns updated seen set."""
-    log.info("Checking for new jobs...")
-    raw_jobs = fetch_jobs()
-    log.info(f"Fetched {len(raw_jobs)} raw jobs from API.")
-
-    new_jobs = []
-    for raw in raw_jobs:
-        job = parse_job(raw)
-        if job and job["job_id"] not in seen:
-            new_jobs.append(job)
-            seen.add(job["job_id"])
-
-    if new_jobs:
-        log.info(f"Found {len(new_jobs)} new job(s)! Sending combined alert...")
-        send_combined_alert(new_jobs)
-    else:
-        log.info("No new jobs found.")
-
-    save_seen(seen)
-    return seen
-
-
 def send_combined_alert(jobs: list):
-    """
-    Send all new jobs in ONE Telegram message.
-    Telegram has a 4096 char limit, so we split into chunks if needed.
-    """
     header = f"🆕 <b>{len(jobs)} new Amazon warehouse job(s) near Leicester!</b>\n"
     separator = "\n" + "─" * 30 + "\n"
+    blocks = [format_job(j) for j in jobs]
 
-    # Build all job blocks
-    blocks = [format_message(job) for job in jobs]
-
-    # Pack as many as fit into one message (Telegram limit: 4096 chars)
     messages = []
     current = header
     for i, block in enumerate(blocks):
-        addition = (separator if i > 0 else "\n") + block
-        if len(current) + len(addition) > 4000:
-            # Flush current message and start a new one
+        chunk = (separator if i > 0 else "\n") + block
+        if len(current) + len(chunk) > 4000:
             messages.append(current)
             current = f"🆕 <b>Continued ({i+1}/{len(blocks)})</b>\n\n" + block
         else:
-            current += addition
+            current += chunk
     messages.append(current)
 
     for msg in messages:
         send_telegram(msg)
         time.sleep(0.3)
 
+# ─── MAIN LOOP ───────────────────────────────────────────────────────────────
+
+def check_once(
+    session: requests.Session,
+    bearer: str,
+    seen: set,
+) -> tuple[set, requests.Session, str]:
+    log.info("Checking for new jobs...")
+    try:
+        jobs = fetch_jobs(session, bearer)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            log.warning("Session expired — re-logging in...")
+            session, bearer = login()
+            jobs = fetch_jobs(session, bearer)
+        else:
+            raise
+
+    log.info(f"Fetched {len(jobs)} job(s) from API.")
+
+    new_jobs = [j for j in jobs if j.get("jobId") and j["jobId"] not in seen]
+    for j in new_jobs:
+        seen.add(j["jobId"])
+
+    if new_jobs:
+        log.info(f"Found {len(new_jobs)} new job(s)! Sending alert...")
+        send_combined_alert(new_jobs)
+    else:
+        log.info("No new jobs found.")
+
+    save_seen(seen)
+    return seen, session, bearer
+
 
 def main():
     log.info("Starting Amazon Job Alert Bot...")
 
+    if not AMAZON_PHONE or not AMAZON_PIN:
+        log.error(
+            "AMAZON_PHONE and AMAZON_PIN must be set.\n"
+            "  export AMAZON_PHONE='+447XXXXXXXXX'\n"
+            "  export AMAZON_PIN='XXXXXX'"
+        )
+        return
+
     if not TELEGRAM_TOKEN:
-        log.warning("⚠️  TELEGRAM_TOKEN not set. Messages will print to console.")
+        log.warning("TELEGRAM_TOKEN not set — messages will print to console.")
     if not TELEGRAM_CHAT_ID:
-        log.warning("⚠️  TELEGRAM_CHAT_ID not set. Messages will print to console.")
+        log.warning("TELEGRAM_CHAT_ID not set — messages will print to console.")
 
     seen = load_seen()
-    log.info(f"Loaded {len(seen)} previously seen jobs.")
+    log.info(f"Loaded {len(seen)} previously seen job(s).")
 
-    send_startup_message()
+    session, bearer = login()
+
+    send_telegram(
+        f"🤖 <b>Amazon Job Alert Bot Started</b>\n\n"
+        f"📍 Watching jobs within <b>{MAX_MILES} miles</b> of Leicester\n"
+        f"🔄 Checking every <b>{POLL_INTERVAL // 60} min</b>\n"
+        "📬 You'll be notified the moment new jobs appear! 🚀"
+    )
 
     while True:
         try:
-            seen = check_once(seen)
+            seen, session, bearer = check_once(session, bearer, seen)
         except Exception as e:
             log.error(f"Unexpected error in main loop: {e}")
 
